@@ -63,7 +63,7 @@ def parse_title(title: str, fallback_number: int, group_mode: str):
     group_name = text or "未命名"
     prefix = text or "未命名"
 
-    # 示例：12-ZB-张三-祷告男-李四-不要划走这个视频...-46211-FF-2026-7-9.mp4
+    # 示例：12-ZB-张三-男-李四-不要划走这个视频...-46211-FF-2026-7-9.mp4
     # 兼容早期示例：485-ZB-王五 老太太1
     match = re.match(r"^(\d+)\s*-\s*([^-]+?)\s*-\s*([^-]+)", text)
     if match:
