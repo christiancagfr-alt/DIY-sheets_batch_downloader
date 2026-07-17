@@ -31,7 +31,7 @@ python sheets_batch_downloader_modern.py
 为了安全，仓库不要提交下面这些本地文件：
 
 - `token.json`
-- `青苹果下载器 1.json`
+- `谷歌授权服务账号 1.json`
 - `credentials.json`
 - `diy_downloader_configs.json`
 
