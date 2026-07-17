@@ -63,8 +63,8 @@ def parse_title(title: str, fallback_number: int, group_mode: str):
     group_name = text or "未命名"
     prefix = text or "未命名"
 
-    # 示例：12-ZB-杨多多-祷告男-佳佳-不要划走这个视频...-46211-FF-2026-7-9.mp4
-    # 兼容早期示例：485-ZB-林娅 老太太1
+    # 示例：12-ZB-莉莉-西瓜-南瓜-不要划走这个视频...-46211-FF-2026-7-9.mp4
+    # 兼容早期示例：485-ZB-lisa 老太太1
     match = re.match(r"^(\d+)\s*-\s*([^-]+?)\s*-\s*([^-]+)", text)
     if match:
         number = match.group(1)
@@ -100,7 +100,7 @@ def looks_like_person_name(segment: str) -> bool:
     # 这些词通常是角色、性别、描述，不当作第二个人名。
     descriptor_words = [
         "男", "女", "牧师", "老师", "祷告", "测试", "简单", "丸子头", "老太太",
-        "祝福", "主啊", "视频", "佳佳", "片段", "旁白", "中文", "英文",
+        "祝福", "主啊", "视频", "花花", "片段", "旁白", "中文", "英文",
     ]
     if any(word in text for word in descriptor_words):
         return False
@@ -125,7 +125,7 @@ def match_keyword(title: str, url: str, keyword: str):
         if key_lower not in haystack:
             continue
 
-        # 如果只筛“刘乐”，则排除“刘乐-刘平-女3”这种后面紧跟另一个人名的组合。
+        # 如果只筛“莉莉”，则排除“莉莉-lisa-女3”这种后面紧跟另一个人名的组合。
         combo = re.search(re.escape(key) + r"\s*-\s*([^-—\s]+)", title_text)
         if combo and looks_like_person_name(combo.group(1)):
             continue
@@ -529,7 +529,7 @@ class App(tk.Tk):
     def _build_ui(self):
         root = ttk.Frame(self, padding=18)
         root.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(root, text="青苹果批量下载器", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(root, text="DIY批量下载器", style="Title.TLabel").pack(anchor="w")
         ttk.Label(root, text="从 Google 表格读取 P 列真实链接，按 A 列名称分文件夹，文件使用源文件名保存。", foreground="#64748b", background="#eef2f7").pack(anchor="w", pady=(4, 14))
 
         top = ttk.Frame(root)
