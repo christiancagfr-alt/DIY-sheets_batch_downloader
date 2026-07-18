@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+
+build/
+dist/
+*.spec
+
+token.json
+credentials.json
+*凭据*.json
+青苹果下载器 1.json
+谷歌服务账号.json
+diy_downloader_configs.json
+
+.env
+.venv/
+venv/
