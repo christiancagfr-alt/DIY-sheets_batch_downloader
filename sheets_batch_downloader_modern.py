@@ -8,6 +8,7 @@ import time
 from collections import Counter
 from html import unescape
 from html.parser import HTMLParser
+from urllib.parse import urlparse
 
 from PySide6.QtCore import QThread, Qt, Signal, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPalette
@@ -155,6 +156,13 @@ def source_name_from_url(url):
     return name if name and name != "file.jpg" else ""
 
 
+def is_drive_link(url):
+    try:
+        return urlparse(str(url or "")).hostname == "drive.google.com"
+    except Exception:
+        return False
+
+
 def should_group_by_prefix(group_mode):
     mode_text = str(group_mode or "").lower()
     return group_mode == "prefix" or "前缀" in mode_text or "ǰ׺" in mode_text
@@ -239,7 +247,7 @@ def resolve_pasted_item_names(items, group_mode, make_client, log_func, stop_eve
     for item in items:
         if stop_event is not None and stop_event.is_set():
             break
-        if client is None and item.url and ("drive.google.com" in item.url or extract_drive_folder_id(item.url)):
+        if client is None and item.url and (is_drive_link(item.url) or extract_drive_folder_id(item.url)):
             client = make_client()
         source_name = resolve_item_source_name(item, client, public_downloader) if client else (item.source_name or "")
         resolved.append(item_with_resolved_source(item, source_name, group_mode))
