@@ -5,11 +5,12 @@ import re
 import sys
 import threading
 import time
+from collections import Counter
 from html import unescape
 from html.parser import HTMLParser
 
 from PySide6.QtCore import QThread, Qt, Signal, QUrl
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -37,6 +38,7 @@ from sheets_batch_downloader import (
     GoogleClient,
     DownloadItem,
     PublicDownloader,
+    extract_drive_folder_id,
     extract_drive_file_info,
     extension_from_name,
     find_url_in_text,
@@ -57,6 +59,28 @@ def app_base_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def user_data_dir():
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    path = os.path.join(base, "DIY下载器")
+    try:
+        os.makedirs(path, exist_ok=True)
+        return path
+    except Exception:
+        return app_base_dir()
+
+
+def state_file_path(name):
+    path = os.path.join(user_data_dir(), name)
+    legacy_path = os.path.join(app_base_dir(), name)
+    if not os.path.exists(path) and os.path.exists(legacy_path):
+        try:
+            import shutil
+            shutil.copy2(legacy_path, path)
+        except Exception:
+            pass
+    return path
 
 
 def default_credentials_path():
@@ -80,11 +104,13 @@ def logo_path():
     return os.path.join(app_base_dir(), "logo.png")
 
 
-def build_target_path(output_dir, item, source_name):
+def build_target_path(output_dir, item, source_name, use_group_folder=True):
     safe_source_name = sanitize_path_part(source_name or "file.jpg")
     if not extension_from_name(safe_source_name):
         safe_source_name += ".jpg"
-    return os.path.join(output_dir, item.group_name, safe_source_name)
+    if use_group_folder:
+        return os.path.join(output_dir, item.group_name, safe_source_name)
+    return os.path.join(output_dir, safe_source_name)
 
 
 class LinkHTMLParser(HTMLParser):
@@ -168,6 +194,44 @@ def parse_pasted_links(plain_text, html_text, group_mode, keyword=""):
     return items
 
 
+def resolve_pasted_item_names(items, group_mode, make_client, log_func, stop_event=None):
+    resolved = []
+    client = None
+    public_downloader = PublicDownloader()
+    log_func(f"正在读取粘贴链接的真实文件名，共 {len(items)} 条...")
+    for item in items:
+        if stop_event is not None and stop_event.is_set():
+            break
+        source_name = item.source_name
+        folder_id = extract_drive_folder_id(item.url)
+        if folder_id:
+            if client is None:
+                client = make_client()
+            folder_name, _ = client.list_drive_folder_files(folder_id)
+            source_name = source_name or folder_name
+        else:
+            file_id, _ = extract_drive_file_info(item.url)
+            if file_id:
+                if client is None:
+                    client = make_client()
+                source_name = client.get_drive_file_name(file_id)
+            elif item.url:
+                source_name = source_name or public_downloader.prepare_name(item.url)
+
+        display_name = source_name or item.title or f"粘贴链接-{item.row_number}"
+        group_name, file_number = parse_title(display_name, item.row_number, group_mode)
+        resolved.append(DownloadItem(
+            item.row_number,
+            display_name,
+            item.url,
+            source_name,
+            item.match_name,
+            group_name,
+            file_number,
+        ))
+    return resolved, client
+
+
 class WorkerBase(QThread):
     log = Signal(str)
     failed = Signal(str)
@@ -237,6 +301,37 @@ class PreviewWorker(WorkerBase):
             self.failed.emit(f"预览失败：{exc}")
 
 
+class PastedPreviewWorker(WorkerBase):
+    preview_ready = Signal(list, list)
+
+    def __init__(self, credentials_path, token_path, items, group_mode):
+        super().__init__(credentials_path, token_path)
+        self.items = items
+        self.group_mode = group_mode
+
+    def run(self):
+        try:
+            items, _ = resolve_pasted_item_names(
+                self.items,
+                self.group_mode,
+                self.make_client,
+                self.log.emit,
+            )
+            rows = [{
+                "row_number": item.row_number,
+                "folder": item.group_name,
+                "title": item.title,
+                "source_name": item.source_name,
+                "match_name": item.match_name,
+                "url": item.url,
+                "has_link": item.url.startswith("http"),
+            } for item in items[:500]]
+            self.preview_ready.emit(rows, items)
+            self.log.emit(f"粘贴预览完成：已读取 {len(items)} 条真实文件名。")
+        except Exception as exc:
+            self.failed.emit(f"粘贴预览失败：{exc}")
+
+
 class DownloadWorker(WorkerBase):
     progress = Signal(dict)
     done = Signal()
@@ -284,6 +379,13 @@ class DownloadWorker(WorkerBase):
             public_downloader = PublicDownloader()
             if self.pasted_items is not None:
                 items = list(self.pasted_items)
+                items, client = resolve_pasted_item_names(
+                    items,
+                    self.settings.get("group_mode") or "按人名",
+                    self.make_client,
+                    self.log.emit,
+                    self.stop_event,
+                )
             else:
                 client = self.make_client()
                 settings = dict(self.settings)
@@ -295,6 +397,7 @@ class DownloadWorker(WorkerBase):
                             self.log.emit(f"已刷新结束行：{info.row_count}")
                             break
                 items = client.read_items(**settings)
+            group_counts = Counter(item.group_name for item in items if item.group_name)
             self.log.emit(f"准备下载 {len(items)} 行。")
 
             for item in items:
@@ -307,18 +410,57 @@ class DownloadWorker(WorkerBase):
                     self.log.emit(f"第 {item.row_number} 行跳过：没有链接")
                     continue
 
-                if re.search(r"drive\.google\.com/(?:drive/(?:u/\d+/)?folders|folderview)", item.url, re.I):
+                if False and re.search(r"drive\.google\.com/(?:drive/(?:u/\d+/)?folders|folderview)", item.url, re.I):
                     skipped += 1
                     self.log.emit(f"第 {item.row_number} 行跳过：文件夹链接")
                     continue
 
                 try:
+                    folder_id = extract_drive_folder_id(item.url)
+                    if folder_id:
+                        if client is None:
+                            client = self.make_client()
+                        folder_name, folder_files = client.list_drive_folder_files(folder_id)
+                        folder_group = item.group_name
+                        if not folder_group or group_counts.get(folder_group, 0) <= 1:
+                            folder_group = sanitize_path_part(folder_name)
+                        folder_item = DownloadItem(
+                            item.row_number,
+                            item.title or folder_name,
+                            item.url,
+                            item.source_name,
+                            item.match_name,
+                            folder_group,
+                            item.file_number,
+                        )
+                        self.log.emit(f"Drive 文件夹：{folder_name}，发现 {len(folder_files)} 个项目")
+                        for folder_file in folder_files:
+                            if self.stop_event.is_set():
+                                self.log.emit("任务已停止")
+                                break
+                            if folder_file.get("mimeType") == "application/vnd.google-apps.folder":
+                                skipped += 1
+                                self.log.emit(f"跳过子文件夹：{folder_file.get('name') or folder_file.get('id')}")
+                                continue
+                            source_name = folder_file.get("name") or "file"
+                            target_path = build_target_path(self.output_dir, folder_item, source_name, True)
+                            if self.skip_existing and os.path.exists(target_path):
+                                skipped += 1
+                                self.log.emit(f"已存在，跳过：{target_path}")
+                                continue
+                            saved_path = client.download_drive_file(folder_file["id"], unique_path(target_path), self.stop_event)
+                            success += 1
+                            self.log.emit(f"成功：{saved_path}")
+                            self.progress.emit({"success": success, "skipped": skipped, "failed": failed})
+                            time.sleep(0.08)
+                        continue
+
                     file_id, _ = extract_drive_file_info(item.url)
                     if file_id:
                         if client is None:
                             client = self.make_client()
                         source_name = item.source_name or client.get_drive_file_name(file_id)
-                        target_path = build_target_path(self.output_dir, item, source_name)
+                        target_path = build_target_path(self.output_dir, item, source_name, group_counts.get(item.group_name, 0) > 1)
                         if self.skip_existing and os.path.exists(target_path):
                             skipped += 1
                             self.log.emit(f"已存在，跳过：{target_path}")
@@ -327,7 +469,7 @@ class DownloadWorker(WorkerBase):
                         saved_path = client.download_drive_file(file_id, unique_path(target_path), self.stop_event)
                     else:
                         source_name = item.source_name or public_downloader.prepare_name(item.url)
-                        target_path = build_target_path(self.output_dir, item, source_name)
+                        target_path = build_target_path(self.output_dir, item, source_name, group_counts.get(item.group_name, 0) > 1)
                         if self.skip_existing and os.path.exists(target_path):
                             skipped += 1
                             self.log.emit(f"已存在，跳过：{target_path}")
@@ -370,6 +512,7 @@ class Card(QFrame):
 class PasteLinksDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("pasteDialog")
         self.setWindowTitle("粘贴链接")
         self.resize(760, 520)
         self.action = ""
@@ -379,13 +522,18 @@ class PasteLinksDialog(QDialog):
         layout.setSpacing(10)
 
         tip = QLabel("支持从表格复制的超链接、HTML 链接、纯文本 URL。粘贴链接下载不需要填写表格 ID 和回填列。")
-        tip.setObjectName("subtitle")
+        tip.setObjectName("pasteTip")
         layout.addWidget(tip)
 
         self.text_box = QTextEdit()
         self.text_box.setObjectName("pasteTextBox")
         self.text_box.setAcceptRichText(True)
         self.text_box.setPlaceholderText("在这里粘贴链接，例如：\n张三-文件名.mp4  https://drive.google.com/file/d/...\n或直接从 Google 表格复制带超链接的单元格。")
+        palette = self.text_box.palette()
+        palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#5f6f86"))
+        palette.setColor(QPalette.ColorRole.Text, QColor("#132238"))
+        palette.setColor(QPalette.ColorRole.Base, QColor("#f8fbff"))
+        self.text_box.setPalette(palette)
         layout.addWidget(self.text_box, 1)
 
         buttons = QHBoxLayout()
@@ -446,8 +594,8 @@ class MainWindow(QMainWindow):
         self.config_queue = []
         self.running_all_configs = False
         self.preview_pasted_items = []
-        self.token_file_path = os.path.join(app_base_dir(), "token.json")
-        self.config_file_path = os.path.join(app_base_dir(), "diy_downloader_configs.json")
+        self.token_file_path = state_file_path("token.json")
+        self.config_file_path = state_file_path("diy_downloader_configs.json")
         self.configs = {}
 
         self.build_ui()
@@ -847,6 +995,17 @@ class MainWindow(QMainWindow):
             QMessageBox {{ background: {colors["dialog_bg"]}; color: {colors["dialog_text"]}; font-family: "Microsoft YaHei UI", "Microsoft YaHei", Arial, sans-serif; }}
             QMessageBox QLabel {{ color: {colors["dialog_text"]}; background: transparent; font-size: 13px; }}
             QMessageBox QPushButton {{ background: {colors["accent"]}; color: #ffffff; border-radius: 9px; padding: 6px 16px; min-width: 64px; }}
+            QDialog#pasteDialog {{ background: #f8fafc; color: #172033; font-family: "Microsoft YaHei UI", "Microsoft YaHei", Arial, sans-serif; }}
+            QDialog#pasteDialog QLabel#pasteTip {{ color: #48617f; background: transparent; font-size: 13px; font-weight: 600; }}
+            QDialog#pasteDialog QTextEdit#pasteTextBox {{ background: #f8fbff; color: #132238; border: 1px solid #b9cbe3; border-radius: 12px; padding: 12px; font-family: "Microsoft YaHei UI", "Microsoft YaHei", Arial, sans-serif; font-size: 14px; selection-background-color: #2563eb; selection-color: #ffffff; }}
+            QDialog#pasteDialog QTextEdit#pasteTextBox:focus {{ border: 1px solid #2563eb; background: #ffffff; }}
+            QDialog#pasteDialog QPushButton {{ background: #2563eb; color: #ffffff; border: 0; border-radius: 10px; padding: 8px 18px; font-weight: 800; min-height: 28px; }}
+            QDialog#pasteDialog QPushButton:hover {{ background: #1d4ed8; }}
+            QDialog#pasteDialog QPushButton#secondaryButton {{ background: #eaf3ff; color: #12345f; border: 1px solid #9fbce2; }}
+            QDialog#pasteDialog QPushButton#secondaryButton:hover {{ background: #dbeafe; border: 1px solid #2563eb; }}
+            QDialog#pasteDialog QPushButton#ghostButton {{ background: #ffffff; color: #334155; border: 1px solid #b9cbe3; }}
+            QDialog#pasteDialog QPushButton#ghostButton:hover {{ background: #f1f5f9; color: #0f172a; border: 1px solid #64748b; }}
+            QDialog#pasteDialog QPushButton:disabled {{ background: #eef2f7; color: #64748b; border: 1px solid #cbd5e1; }}
             QScrollBar:vertical, QScrollBar:horizontal {{ background: transparent; width: 10px; height: 10px; }}
             QScrollBar::handle:vertical, QScrollBar::handle:horizontal {{ background: {colors["line"]}; border-radius: 5px; min-height: 30px; min-width: 30px; }}
             QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
@@ -936,6 +1095,21 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, APP_TITLE, "没有解析到可下载链接。请确认粘贴内容里包含 http/https 链接。")
             return
         if dialog.action == "preview":
+            self.set_running_state(True)
+            self.status_row.setText("正在读取粘贴链接的真实文件名...")
+            worker = PastedPreviewWorker(
+                self.credentials_edit.text(),
+                self.token_file_path,
+                items,
+                self.folder_mode_combo.currentText(),
+            )
+            worker.log.connect(self.log)
+            worker.failed.connect(self.show_error)
+            worker.preview_ready.connect(self.on_pasted_preview_ready)
+            worker.finished.connect(self.on_pasted_preview_finished)
+            self.worker = worker
+            worker.start()
+            return
             self.preview_pasted_items = list(items)
             self.fill_preview(self.items_to_preview_rows(items[:500]))
             link_count = sum(1 for item in items if item.url.startswith("http"))
@@ -943,6 +1117,18 @@ class MainWindow(QMainWindow):
             self.log(f"粘贴预览完成：解析 {len(items)} 行，其中 {link_count} 行有链接。可直接点击“开始下载”。")
             return
         self.start_pasted_download(items)
+
+    def on_pasted_preview_ready(self, rows, items):
+        self.preview_pasted_items = list(items)
+        self.fill_preview(rows)
+        link_count = sum(1 for item in items if item.url.startswith("http"))
+        self.status_row.setText(f"粘贴预览完成：显示 {len(rows)} 行，可直接点开始下载")
+        self.log(f"粘贴预览完成：读取真实文件名 {len(items)} 条，其中 {link_count} 条有链接。")
+
+    def on_pasted_preview_finished(self):
+        if self.sender() is self.worker:
+            self.worker = None
+        self.set_running_state(False)
 
     def start_pasted_download(self, items):
         output_dir = self.output_edit.text().strip()
@@ -956,7 +1142,7 @@ class MainWindow(QMainWindow):
         worker = DownloadWorker(
             self.credentials_edit.text(),
             self.token_file_path,
-            {},
+            {"group_mode": self.folder_mode_combo.currentText()},
             output_dir,
             self.skip_existing_check.isChecked(),
             False,

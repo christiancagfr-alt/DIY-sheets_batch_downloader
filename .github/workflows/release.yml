@@ -71,4 +71,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: 'release/DIYDownloader-${{ github.ref_name }}-windows.exe'
-          generate_release_notes: true
+          name: 'DIY下载器 ${{ github.ref_name }}'
+          body_path: release_notes.md

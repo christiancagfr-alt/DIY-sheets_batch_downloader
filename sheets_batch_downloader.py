@@ -49,6 +49,28 @@ def require_google_libs():
     return GoogleAuthRequest, service_account, Credentials, InstalledAppFlow, build, MediaIoBaseDownload
 
 
+def user_data_dir():
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    path = os.path.join(base, "DIY下载器")
+    try:
+        os.makedirs(path, exist_ok=True)
+        return path
+    except Exception:
+        return os.path.dirname(os.path.abspath(__file__))
+
+
+def state_file_path(name: str, legacy_dir: str = ""):
+    path = os.path.join(user_data_dir(), name)
+    legacy_path = os.path.join(legacy_dir, name) if legacy_dir else ""
+    if legacy_path and not os.path.exists(path) and os.path.exists(legacy_path):
+        try:
+            import shutil
+            shutil.copy2(legacy_path, path)
+        except Exception:
+            pass
+    return path
+
+
 def sanitize_path_part(value: str) -> str:
     text = str(value or "未命名")
     text = re.sub(r'[\\/:*?"<>|]', "_", text)
@@ -176,6 +198,29 @@ def extract_drive_file_info(url: str):
         return file_id, resource_key
 
     return "", resource_key
+
+
+def extract_drive_folder_id(url: str):
+    text = str(url or "").strip()
+    parsed = urlparse(text)
+    query = parse_qs(parsed.query)
+
+    match = re.search(r"/folders/([a-zA-Z0-9_-]+)", text)
+    if match:
+        return match.group(1)
+
+    match = re.search(r"/drive/(?:u/\d+/)?folders/([a-zA-Z0-9_-]+)", text)
+    if match:
+        return match.group(1)
+
+    folder_id = query.get("folderId", [""])[0]
+    if folder_id:
+        return folder_id
+
+    if "folderview" in parsed.path.lower():
+        return query.get("id", [""])[0]
+
+    return ""
 
 
 def extension_from_name(name: str) -> str:
@@ -422,6 +467,31 @@ class GoogleClient:
         ).execute()
         return metadata.get("name") or "file"
 
+    def list_drive_folder_files(self, folder_id: str):
+        folder_metadata = self.drive.files().get(
+            fileId=folder_id,
+            fields="name",
+            supportsAllDrives=True,
+        ).execute()
+        folder_name = folder_metadata.get("name") or "Drive Folder"
+        files = []
+        page_token = None
+        query = f"'{folder_id}' in parents and trashed=false"
+        while True:
+            result = self.drive.files().list(
+                q=query,
+                fields="nextPageToken, files(id, name, mimeType)",
+                pageSize=1000,
+                pageToken=page_token,
+                includeItemsFromAllDrives=True,
+                supportsAllDrives=True,
+            ).execute()
+            files.extend(result.get("files") or [])
+            page_token = result.get("nextPageToken")
+            if not page_token:
+                break
+        return folder_name, files
+
     def download_drive_file(self, file_id: str, target_path: str, stop_event: threading.Event):
         os.makedirs(os.path.dirname(target_path), exist_ok=True)
         request = self.drive.files().get_media(fileId=file_id, supportsAllDrives=True)
@@ -488,7 +558,7 @@ class App(tk.Tk):
         default_service_account = os.path.join(base_dir, "谷歌服务账号.json")
         default_credentials = default_service_account if os.path.exists(default_service_account) else os.path.join(base_dir, "credentials.json")
         self.credentials_path = tk.StringVar(value=default_credentials)
-        self.token_path = tk.StringVar(value=os.path.join(base_dir, "token.json"))
+        self.token_path = tk.StringVar(value=state_file_path("token.json", base_dir))
         self.output_dir = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "Downloads", "批量下载"))
         self.spreadsheet_id = tk.StringVar()
         self.sheet_name = tk.StringVar()
