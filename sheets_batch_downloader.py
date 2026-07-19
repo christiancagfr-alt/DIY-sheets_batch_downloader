@@ -79,6 +79,10 @@ def sanitize_path_part(value: str) -> str:
     return text[:150] or "未命名"
 
 
+def is_url_like(value: str) -> bool:
+    return bool(re.match(r"^https?://", str(value or "").strip(), re.I))
+
+
 def parse_title(title: str, fallback_number: int, group_mode: str):
     text = str(title or "").strip()
     number = str(fallback_number)
@@ -100,9 +104,10 @@ def parse_title(title: str, fallback_number: int, group_mode: str):
         prefix = first_part or text or "未命名"
         group_name = first_part or text or "未命名"
 
-    if group_mode in ("prefix", "按编号前缀"):
+    mode_text = str(group_mode or "").lower()
+    if group_mode in ("prefix", "按编号前缀") or "前缀" in mode_text or "ǰ׺" in mode_text:
         group_name = prefix
-    elif group_mode in ("full", "按A列完整名称"):
+    elif group_mode in ("full", "按A列完整名称") or "完整" in mode_text:
         group_name = text or "未命名"
 
     return sanitize_path_part(group_name), sanitize_path_part(number)
@@ -451,6 +456,8 @@ class GoogleClient:
             title = get_cell_text(name_cell).strip()
             source_name = get_cell_text(link_cell).strip()
             url = get_cell_link(link_cell).strip() or find_url_in_text(source_name)
+            if is_url_like(source_name):
+                source_name = ""
             matched_name = match_keyword(title, url, keyword)
             if keyword and not matched_name:
                 continue

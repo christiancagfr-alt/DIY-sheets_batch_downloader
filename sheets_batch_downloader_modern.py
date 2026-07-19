@@ -42,6 +42,7 @@ from sheets_batch_downloader import (
     extract_drive_file_info,
     extension_from_name,
     find_url_in_text,
+    is_url_like,
     parse_title,
     sanitize_path_part,
     unique_path,
@@ -154,6 +155,42 @@ def source_name_from_url(url):
     return name if name and name != "file.jpg" else ""
 
 
+def should_group_by_prefix(group_mode):
+    mode_text = str(group_mode or "").lower()
+    return group_mode == "prefix" or "前缀" in mode_text or "ǰ׺" in mode_text
+
+
+def resolve_item_source_name(item, client, public_downloader):
+    source_name = "" if is_url_like(item.source_name) else (item.source_name or "")
+    folder_id = extract_drive_folder_id(item.url)
+    if folder_id:
+        folder_name, _ = client.list_drive_folder_files(folder_id)
+        return source_name or folder_name
+
+    file_id, _ = extract_drive_file_info(item.url)
+    if file_id:
+        return client.get_drive_file_name(file_id)
+
+    if item.url:
+        return source_name or public_downloader.prepare_name(item.url)
+    return source_name
+
+
+def item_with_resolved_source(item, source_name, group_mode):
+    display_name = source_name or item.title or f"粘贴链接-{item.row_number}"
+    group_basis = display_name if should_group_by_prefix(group_mode) else (item.title or display_name)
+    group_name, file_number = parse_title(group_basis, item.row_number, group_mode)
+    return DownloadItem(
+        item.row_number,
+        item.title or display_name,
+        item.url,
+        source_name,
+        item.match_name,
+        group_name,
+        file_number,
+    )
+
+
 def parse_pasted_links(plain_text, html_text, group_mode, keyword=""):
     records = []
 
@@ -185,7 +222,7 @@ def parse_pasted_links(plain_text, html_text, group_mode, keyword=""):
         if url in seen:
             continue
         seen.add(url)
-        source_name = title or source_name_from_url(url)
+        source_name = "" if is_url_like(title) else (title or source_name_from_url(url))
         display_name = source_name or f"粘贴链接-{index}"
         if keyword_text and keyword_text not in display_name.lower() and keyword_text not in url.lower():
             continue
@@ -202,33 +239,10 @@ def resolve_pasted_item_names(items, group_mode, make_client, log_func, stop_eve
     for item in items:
         if stop_event is not None and stop_event.is_set():
             break
-        source_name = item.source_name
-        folder_id = extract_drive_folder_id(item.url)
-        if folder_id:
-            if client is None:
-                client = make_client()
-            folder_name, _ = client.list_drive_folder_files(folder_id)
-            source_name = source_name or folder_name
-        else:
-            file_id, _ = extract_drive_file_info(item.url)
-            if file_id:
-                if client is None:
-                    client = make_client()
-                source_name = client.get_drive_file_name(file_id)
-            elif item.url:
-                source_name = source_name or public_downloader.prepare_name(item.url)
-
-        display_name = source_name or item.title or f"粘贴链接-{item.row_number}"
-        group_name, file_number = parse_title(display_name, item.row_number, group_mode)
-        resolved.append(DownloadItem(
-            item.row_number,
-            display_name,
-            item.url,
-            source_name,
-            item.match_name,
-            group_name,
-            file_number,
-        ))
+        if client is None and item.url and ("drive.google.com" in item.url or extract_drive_folder_id(item.url)):
+            client = make_client()
+        source_name = resolve_item_source_name(item, client, public_downloader) if client else (item.source_name or "")
+        resolved.append(item_with_resolved_source(item, source_name, group_mode))
     return resolved, client
 
 
@@ -283,6 +297,18 @@ class PreviewWorker(WorkerBase):
                         self.log.emit(f"已刷新结束行：{info.row_count}")
                         break
             items = client.read_items(**settings)
+            public_downloader = PublicDownloader()
+            resolved_items = []
+            group_mode = settings.get("group_mode") or ""
+            for item in items:
+                if item.url and item.url.startswith("http"):
+                    try:
+                        source_name = resolve_item_source_name(item, client, public_downloader)
+                        item = item_with_resolved_source(item, source_name, group_mode)
+                    except Exception as exc:
+                        self.log.emit(f"第 {item.row_number} 行读取源文件名失败：{exc}")
+                resolved_items.append(item)
+            items = resolved_items
             rows = []
             for item in items[:500]:
                 rows.append({
@@ -459,7 +485,8 @@ class DownloadWorker(WorkerBase):
                     if file_id:
                         if client is None:
                             client = self.make_client()
-                        source_name = item.source_name or client.get_drive_file_name(file_id)
+                        source_name = "" if is_url_like(item.source_name) else item.source_name
+                        source_name = source_name or client.get_drive_file_name(file_id)
                         target_path = build_target_path(self.output_dir, item, source_name, group_counts.get(item.group_name, 0) > 1)
                         if self.skip_existing and os.path.exists(target_path):
                             skipped += 1
@@ -468,7 +495,8 @@ class DownloadWorker(WorkerBase):
                             continue
                         saved_path = client.download_drive_file(file_id, unique_path(target_path), self.stop_event)
                     else:
-                        source_name = item.source_name or public_downloader.prepare_name(item.url)
+                        source_name = "" if is_url_like(item.source_name) else item.source_name
+                        source_name = source_name or public_downloader.prepare_name(item.url)
                         target_path = build_target_path(self.output_dir, item, source_name, group_counts.get(item.group_name, 0) > 1)
                         if self.skip_existing and os.path.exists(target_path):
                             skipped += 1
