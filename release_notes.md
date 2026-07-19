@@ -12,6 +12,7 @@
 - 修复表格预览中 P 列显示为 URL 时，“源文件名”没有读取 Google Drive 真实文件名的问题。
 - 修复“按编号前缀”在源文件名参与分组时没有生效的问题。
 - 继续收敛 URL 判断逻辑，避免安全扫描中的子串判断告警。
+- 新增 macOS 版本，Release 页面会同时提供 Windows exe 和 macOS app 压缩包。
 
 ## 使用提醒
 
@@ -21,4 +22,4 @@
 
 ## 安全发布
 
-该版本由 GitHub Actions 自动构建、自动上传 Release，并生成 Artifact Attestation。请优先从 GitHub Release 页面下载由工作流生成的安装包。
+该版本由 GitHub Actions 自动构建 Windows 和 macOS 产物、自动上传 Release，并生成 Artifact Attestation。请优先从 GitHub Release 页面下载由工作流生成的安装包。

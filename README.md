@@ -54,6 +54,15 @@ pip install -r requirements_google.txt
 python sheets_batch_downloader_modern.py
 ```
 
+## 下载版本
+
+Release 页面会提供两个版本：
+
+- Windows：`DIYDownloader-v版本号-windows.exe`
+- macOS：`DIYDownloader-v版本号-macos.zip`
+
+macOS 版本解压后是 `DIYDownloader.app`。首次打开时，如果系统提示来自互联网或未签名应用，可以在“系统设置 → 隐私与安全性”里允许打开。
+
 ## GitHub 安全发布
 
 仓库已配置 `.github/workflows/release.yml`，发布方式为推送版本 tag：
@@ -63,6 +72,6 @@ git tag v1.0.1
 git push origin v1.0.1
 ```
 
-GitHub Actions 会在 `windows-latest` runner 上构建 Windows exe，生成 Artifact Attestation，并使用默认 `GITHUB_TOKEN` 创建 Release 和上传产物。
+GitHub Actions 会在 `windows-latest` runner 上构建 Windows exe，在 `macos-latest` runner 上构建 macOS app 压缩包，生成 Artifact Attestation，并使用默认 `GITHUB_TOKEN` 创建 Release 和上传产物。
 
 请不要手动在 GitHub Release 页面拖拽上传产物，否则平台的 L2 Attestation 校验可能失败。
