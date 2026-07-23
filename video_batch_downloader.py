@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -54,11 +55,28 @@ YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 # 真实播放列表前缀；RD/UL 等为电台/混播，默认不当整表下载
 YOUTUBE_REAL_PLAYLIST_PREFIXES = ("PL", "UU", "FL", "OL", "LL", "WL", "TL")
 
+# 格式串说明：
+# - YouTube 高清几乎都是「视频轨 + 音频轨」分离，必须用 bestvideo+bestaudio 再合并
+# - 单文件 progressive（format 18 等）最高通常只有 360p，绝不能当 1080p 用
+# - 优先 avc1+m4a 便于合成兼容性好的 mp4；没有则回退 vp9/av1 + 最佳音轨
+def _height_format(max_h: int) -> str:
+    return (
+        f"bestvideo[height<={max_h}][vcodec^=avc1]+bestaudio[ext=m4a]/"
+        f"bestvideo[height<={max_h}][vcodec^=avc1]+bestaudio/"
+        f"bestvideo[height<={max_h}]+bestaudio/"
+        f"best[height<={max_h}]/"
+        f"bestvideo+bestaudio/best"
+    )
+
+
 QUALITY_OPTIONS = {
-    "最佳质量": "bv*+ba/b",
-    "最高 1080p": "bv*[height<=1080]+ba/b[height<=1080]/b",
-    "最高 720p": "bv*[height<=720]+ba/b[height<=720]/b",
-    "最高 480p": "bv*[height<=480]+ba/b[height<=480]/b",
+    "最佳质量": (
+        "bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/"
+        "bestvideo+bestaudio/best"
+    ),
+    "最高 1080p": _height_format(1080),
+    "最高 720p": _height_format(720),
+    "最高 480p": _height_format(480),
     "仅音频": "bestaudio/best",
 }
 
@@ -298,17 +316,19 @@ def default_ydl_opts(**extra) -> dict:
         "fragment_retries": 10,
         "file_access_retries": 5,
         "extractor_retries": 3,
-        "concurrent_fragment_downloads": 1,
+        "concurrent_fragment_downloads": 4,
         # 断点续传核心
         "continuedl": True,
         "nopart": False,
         "updatetime": False,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "web"],
-            }
-        },
+        # 优先高分辨率 / 高码率；不要用 android client（会只剩 360p 左右）
+        "format_sort": ["res", "fps", "hdr:12", "vbr", "abr", "tbr", "size"],
+        "format_sort_force": True,
     }
+    ffmpeg = resolve_ffmpeg_path()
+    if ffmpeg:
+        # yt-dlp 接受 ffmpeg 可执行文件所在目录
+        opts["ffmpeg_location"] = os.path.dirname(ffmpeg)
     opts.update(extra)
     return opts
 
@@ -327,9 +347,69 @@ def format_duration(seconds) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
-def has_ffmpeg() -> bool:
-    return bool(shutil.which("ffmpeg"))
+def resolve_ffmpeg_path() -> str:
+    """查找可用 ffmpeg，避免因找不到工具而静默降到 360p 单文件。"""
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    # 常见便携/自定义安装路径
+    candidates = [
+        r"D:\software\audiokit\ffmpeg_win\ffmpeg.EXE",
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe",
+        os.path.join(os.path.expanduser("~"), "ffmpeg", "bin", "ffmpeg.exe"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "ffmpeg.exe"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", "ffmpeg.exe"),
+    ]
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(os.path.abspath(sys.executable))
+        candidates.extend([
+            os.path.join(base, "ffmpeg.exe"),
+            os.path.join(base, "bin", "ffmpeg.exe"),
+            os.path.join(getattr(sys, "_MEIPASS", base), "ffmpeg.exe"),
+        ])
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    try:
+        import imageio_ffmpeg  # type: ignore
+        path = imageio_ffmpeg.get_ffmpeg_exe()
+        if path and os.path.isfile(path):
+            return path
+    except Exception:
+        pass
+    return ""
 
+
+def has_ffmpeg() -> bool:
+    return bool(resolve_ffmpeg_path())
+
+
+def describe_selected_format(info: dict) -> str:
+    """用于日志：显示最终选中的分辨率/编码，方便排查画质问题。"""
+    if not info:
+        return "未知"
+    parts = []
+    req = info.get("requested_formats")
+    if req:
+        for f in req:
+            h = f.get("height")
+            v = f.get("vcodec") or "none"
+            a = f.get("acodec") or "none"
+            fid = f.get("format_id")
+            note = f.get("format_note") or ""
+            if v != "none":
+                parts.append(f"视频 {h or '?'}p/{fid}/{v}/{note}".strip("/"))
+            if a != "none":
+                parts.append(f"音频 {fid}/{a}")
+    else:
+        h = info.get("height")
+        parts.append(
+            f"{h or '?'}p id={info.get('format_id')} "
+            f"v={info.get('vcodec')} a={info.get('acodec')}"
+        )
+    return " + ".join(parts) if parts else "未知"
 
 def entry_to_url(entry: dict, fallback: str = "") -> str:
     if not entry:
@@ -637,6 +717,7 @@ class VideoDownloadWorker(QThread):
 
     def _build_opts(self, target_dir: str, item: VideoItem, progress_hook: Callable) -> dict:
         fmt = QUALITY_OPTIONS.get(self.quality_key, QUALITY_OPTIONS["最佳质量"])
+        ffmpeg = resolve_ffmpeg_path()
         opts = default_ydl_opts(
             outtmpl=self._outtmpl(target_dir, item),
             format=fmt,
@@ -651,10 +732,18 @@ class VideoDownloadWorker(QThread):
             retries=15,
             fragment_retries=15,
         )
-        if has_ffmpeg():
+        if ffmpeg:
+            opts["ffmpeg_location"] = os.path.dirname(ffmpeg)
             opts["merge_output_format"] = "mp4"
+            self.log.emit(f"使用 ffmpeg：{ffmpeg}")
+        else:
+            # 切勿降级为单文件 b（YouTube 常只有 360p）
+            self.log.emit(
+                "警告：未检测到 ffmpeg。YouTube 1080p/高清需要合并视频+音频，"
+                "缺少 ffmpeg 时可能失败或画质很差。请安装 ffmpeg 并加入 PATH。"
+            )
         if self.quality_key == "仅音频":
-            if has_ffmpeg():
+            if ffmpeg:
                 opts["postprocessors"] = [{
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "mp3",
@@ -662,14 +751,6 @@ class VideoDownloadWorker(QThread):
                 }]
             else:
                 self.log.emit("未检测到 ffmpeg，仅音频将保留原始音频格式。")
-        elif not has_ffmpeg():
-            opts["format"] = {
-                "最佳质量": "b",
-                "最高 1080p": "b[height<=1080]/b",
-                "最高 720p": "b[height<=720]/b",
-                "最高 480p": "b[height<=480]/b",
-            }.get(self.quality_key, "b")
-            self.log.emit("未检测到 ffmpeg，已改用单文件格式下载。")
         return opts
 
     def run(self):
@@ -773,18 +854,38 @@ class VideoDownloadWorker(QThread):
 
                 opts = self._build_opts(target_dir, item, hook)
                 with yt_dlp.YoutubeDL(opts) as ydl:
-                    # 若标题仍空，先取信息
-                    if not item.title or item.title.startswith("视频-") or item.title.startswith("链接-"):
-                        info = ydl.extract_info(item.url, download=False)
-                        if info:
-                            if info.get("_type") == "playlist":
-                                entries = [e for e in (info.get("entries") or []) if e]
-                                info = entries[0] if entries else info
-                            item.title = sanitize_filename(info.get("title") or item.title)
-                            item.duration = item.duration or format_duration(info.get("duration"))
-                            item.video_id = str(info.get("id") or item.video_id or "")
-                            if detect_platform(item.url) == "YouTube" and item.video_id and YOUTUBE_ID_RE.fullmatch(item.video_id):
-                                item.url = youtube_watch_url(item.video_id)
+                    # 先解析并确认实际选中的分辨率（避免误下 360p）
+                    info = ydl.extract_info(item.url, download=False)
+                    if info:
+                        if info.get("_type") == "playlist":
+                            entries = [e for e in (info.get("entries") or []) if e]
+                            info = entries[0] if entries else info
+                        item.title = sanitize_filename(info.get("title") or item.title)
+                        item.duration = item.duration or format_duration(info.get("duration"))
+                        item.video_id = str(info.get("id") or item.video_id or "")
+                        if detect_platform(item.url) == "YouTube" and item.video_id and YOUTUBE_ID_RE.fullmatch(item.video_id):
+                            item.url = youtube_watch_url(item.video_id)
+                        fmt_desc = describe_selected_format(info)
+                        self.log.emit(f"画质选择 [{self.quality_key}]：{fmt_desc}")
+                        # 若期望 720/1080 却只拿到很低分辨率，给出明确警告
+                        sel_h = 0
+                        for f in (info.get("requested_formats") or [info]):
+                            try:
+                                sel_h = max(sel_h, int(f.get("height") or 0))
+                            except (TypeError, ValueError):
+                                pass
+                        want = 0
+                        if "1080" in self.quality_key:
+                            want = 1080
+                        elif "720" in self.quality_key:
+                            want = 720
+                        elif "480" in self.quality_key:
+                            want = 480
+                        if want and sel_h and sel_h < min(want, 720) and sel_h <= 360:
+                            self.log.emit(
+                                f"警告：期望约 {want}p，实际仅 {sel_h}p。"
+                                "请确认已安装 ffmpeg，并检查源视频是否提供该分辨率。"
+                            )
 
                     ydl.download([item.url])
 
@@ -999,8 +1100,12 @@ class VideoBatchPage(QWidget):
         root.addWidget(self.status_row)
 
         env_tip = "yt-dlp 已就绪" if yt_dlp is not None else "未安装 yt-dlp，请先 pip install yt-dlp"
-        if yt_dlp is not None and not has_ffmpeg():
-            env_tip += " · 建议安装 ffmpeg 以获得最佳画质合并"
+        if yt_dlp is not None:
+            ff = resolve_ffmpeg_path()
+            if ff:
+                env_tip += f" · ffmpeg 已就绪（高清合并）"
+            else:
+                env_tip += " · 未检测到 ffmpeg：1080p 可能失败或严重掉画质，请安装 ffmpeg"
         env_tip += " · 断点续传默认开启 · 开始下载时自动加载链接"
         self.log(env_tip)
 
