@@ -82,19 +82,20 @@ jobs:
           $tag = "${{ github.ref_name }}"
           $ver = "${{ steps.ver.outputs.version }}"
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          $exe = (Resolve-Path "dist\DIYDownloader.exe").Path
+          $outDir = (Resolve-Path ".").Path + "\release"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+          # Inno 相对路径以 .iss 所在目录为基准，这里传绝对路径
           & $iscc `
             "/DMyAppVersion=$ver" `
-            "/DMyAppSourceExe=dist\DIYDownloader.exe" `
+            "/DMyAppSourceExe=$exe" `
+            "/O$outDir" `
+            "/FDIYDownloader-$tag-windows-setup" `
             "installer\diy_downloader.iss"
-          # Inno 默认输出到 release，文件名含版本
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
           $setup = Get-ChildItem "release\*setup*.exe" | Select-Object -First 1
           if (-not $setup) { throw "Installer not produced" }
-          $target = "release/DIYDownloader-$tag-windows-setup.exe"
-          if ($setup.FullName -ne (Resolve-Path $target -ErrorAction SilentlyContinue)) {
-            Copy-Item $setup.FullName $target -Force
-          }
           Get-ChildItem release | Format-Table Name, Length
-
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
