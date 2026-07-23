@@ -44,14 +44,18 @@ jobs:
           "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           Write-Host "APP_VERSION=$v"
 
-      - name: Build Windows exe
+      - name: Build Windows onedir
         shell: pwsh
         run: |
+          # 使用 onedir（不要 onefile）：
+          # onefile 每次启动解压到 %TEMP%\_MEI*，常出现
+          # Failed to load Python DLL ... python312.dll / 找不到指定的模块
           python -m PyInstaller `
             --noconfirm `
             --clean `
-            --onefile `
+            --onedir `
             --windowed `
+            --noupx `
             --name "DIYDownloader" `
             --icon "logo.ico" `
             --add-data "assets;assets" `
@@ -65,9 +69,18 @@ jobs:
             --hidden-import "video_batch_downloader" `
             "sheets_batch_downloader_modern.py"
 
+          if (-not (Test-Path "dist\DIYDownloader\DIYDownloader.exe")) {
+            throw "onedir build missing dist\DIYDownloader\DIYDownloader.exe"
+          }
+
           New-Item -ItemType Directory -Force -Path "release" | Out-Null
           $tag = "${{ github.ref_name }}"
-          Copy-Item "dist/DIYDownloader.exe" "release/DIYDownloader-$tag-windows.exe"
+
+          # 便携版：整个目录打 zip（解压即用，不经 Temp 解压 DLL）
+          $zipPath = "release\DIYDownloader-$tag-windows.zip"
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          Compress-Archive -Path "dist\DIYDownloader\*" -DestinationPath $zipPath -Force
+          Write-Host "Portable zip:" (Get-Item $zipPath).Length
 
       - name: Install Inno Setup
         shell: pwsh
@@ -83,13 +96,12 @@ jobs:
           $tag = "${{ github.ref_name }}"
           $ver = "${{ steps.ver.outputs.version }}"
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-          $exe = (Resolve-Path "dist\DIYDownloader.exe").Path
+          $srcDir = (Resolve-Path "dist\DIYDownloader").Path
           $outDir = (Resolve-Path ".").Path + "\release"
           New-Item -ItemType Directory -Force -Path $outDir | Out-Null
-          # Inno 相对路径以 .iss 所在目录为基准，这里传绝对路径
           & $iscc `
             "/DMyAppVersion=$ver" `
-            "/DMyAppSourceExe=$exe" `
+            "/DMyAppSourceDir=$srcDir" `
             "/O$outDir" `
             "/FDIYDownloader-$tag-windows-setup" `
             "installer\diy_downloader.iss"
@@ -97,12 +109,13 @@ jobs:
           $setup = Get-ChildItem "release\*setup*.exe" | Select-Object -First 1
           if (-not $setup) { throw "Installer not produced" }
           Get-ChildItem release | Format-Table Name, Length
+
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
           name: windows-release
           path: |
-            release/DIYDownloader-${{ github.ref_name }}-windows.exe
+            release/DIYDownloader-${{ github.ref_name }}-windows.zip
             release/DIYDownloader-${{ github.ref_name }}-windows-setup.exe
           if-no-files-found: error
 
@@ -131,6 +144,7 @@ jobs:
             --noconfirm \
             --clean \
             --windowed \
+            --noupx \
             --name "DIYDownloader" \
             --add-data "assets:assets" \
             --add-data "logo.png:." \

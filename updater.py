@@ -60,13 +60,18 @@ def _pick_asset(assets: list) -> Optional[dict]:
     if not assets:
         return None
     names = [(a, str(a.get("name") or "")) for a in assets]
-    # 优先安装包
+    # 优先 Windows 安装包（onedir，稳定）
     for a, name in names:
         lower = name.lower()
         if lower.endswith("-setup.exe") or lower.endswith("setup.exe") or "installer" in lower:
             if lower.endswith(".exe"):
                 return a
-    # 其次 Windows 便携版
+    # 其次 Windows 便携 zip（onedir 压缩包）
+    for a, name in names:
+        lower = name.lower()
+        if "windows" in lower and lower.endswith(".zip"):
+            return a
+    # 兼容旧版 onefile exe
     for a, name in names:
         lower = name.lower()
         if "windows" in lower and lower.endswith(".exe"):
@@ -97,6 +102,7 @@ def fetch_latest_release() -> Optional[ReleaseInfo]:
     is_installer = bool(
         re.search(r"(setup|installer|install)", name, re.I)
         or name.lower().endswith("-setup.exe")
+        or name.lower().endswith(".zip")  # 便携 zip：下载后打开目录由用户解压覆盖
     )
     return ReleaseInfo(
         tag=tag,
@@ -171,11 +177,19 @@ def launch_installer_or_replace(downloaded_path: str, is_installer: bool) -> Non
     if not os.path.isfile(downloaded_path):
         raise FileNotFoundError(downloaded_path)
 
-    if is_installer or downloaded_path.lower().endswith("setup.exe"):
+    lower = downloaded_path.lower()
+    if is_installer or lower.endswith("setup.exe"):
         if sys.platform.startswith("win"):
             os.startfile(downloaded_path)  # type: ignore[attr-defined]
         else:
             subprocess.Popen([downloaded_path], close_fds=True)
+        return
+
+    # zip 便携包：打开所在目录，提示用户解压覆盖安装目录
+    if lower.endswith(".zip"):
+        folder = os.path.dirname(downloaded_path)
+        if sys.platform.startswith("win"):
+            os.startfile(folder)  # type: ignore[attr-defined]
         return
 
     # 便携版：替换自身

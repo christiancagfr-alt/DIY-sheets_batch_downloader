@@ -1,12 +1,12 @@
 ; Inno Setup script for DIY下载器
-; 在 CI 中由 iscc 编译，产出可安装版本。
+; 使用 PyInstaller onedir 目录安装，避免 onefile 在 Temp\_MEI 解压 python312.dll 失败。
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.1.0"
+  #define MyAppVersion "1.1.4"
 #endif
 
-#ifndef MyAppSourceExe
-  #define MyAppSourceExe "..\dist\DIYDownloader.exe"
+#ifndef MyAppSourceDir
+  #define MyAppSourceDir "..\dist\DIYDownloader"
 #endif
 
 #define MyAppName "DIY下载器"
@@ -22,7 +22,7 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}/releases
-DefaultDirName={autopf}\DIYDownloader
+DefaultDirName={localappdata}\DIYDownloader
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=..\release
@@ -31,11 +31,13 @@ SetupIconFile=..\logo.ico
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
+; 默认装到用户目录，无需管理员；减少 Program Files 权限问题
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\{#MyAppExeName}
-; VersionInfoVersion 需要 x.x.x.x，这里仅用产品版本字符串
+CloseApplications=yes
+RestartApplications=no
 VersionInfoCompany={#MyAppPublisher}
 VersionInfoDescription={#MyAppName} Installer
 VersionInfoProductName={#MyAppName}
@@ -48,13 +50,15 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a desktop icon"; GroupDescription: "Additional icons:"; Flags: checkedonce
 
 [Files]
-Source: "{#MyAppSourceExe}"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
+; 整个 onedir 目录递归安装（含 python312.dll 与依赖，不再从 Temp 解压）
+Source: "{#MyAppSourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\logo.png"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\logo.ico"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
 Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "立即运行 {#MyAppName}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Description: "立即运行 {#MyAppName}"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
