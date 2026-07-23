@@ -5,13 +5,11 @@ import re
 import sys
 import threading
 import time
-from collections import Counter
 from html import unescape
 from html.parser import HTMLParser
-from urllib.parse import urlparse
 
 from PySide6.QtCore import QThread, Qt, Signal, QUrl
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPalette
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -28,6 +26,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSpinBox,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -39,18 +38,24 @@ from sheets_batch_downloader import (
     GoogleClient,
     DownloadItem,
     PublicDownloader,
-    extract_drive_folder_id,
     extract_drive_file_info,
     extension_from_name,
     find_url_in_text,
-    is_url_like,
     parse_title,
     sanitize_path_part,
     unique_path,
 )
+from video_batch_downloader import VideoBatchPage
+from version import APP_NAME, APP_VERSION, RELEASES_PAGE
+from updater import (
+    check_for_update,
+    download_release,
+    format_size,
+    launch_installer_or_replace,
+)
 
 
-APP_TITLE = "DIY下载器"
+APP_TITLE = f"{APP_NAME} v{APP_VERSION}"
 
 
 def bundle_base_dir():
@@ -61,28 +66,6 @@ def app_base_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
-
-
-def user_data_dir():
-    base = os.environ.get("APPDATA") or os.path.expanduser("~")
-    path = os.path.join(base, "DIY下载器")
-    try:
-        os.makedirs(path, exist_ok=True)
-        return path
-    except Exception:
-        return app_base_dir()
-
-
-def state_file_path(name):
-    path = os.path.join(user_data_dir(), name)
-    legacy_path = os.path.join(app_base_dir(), name)
-    if not os.path.exists(path) and os.path.exists(legacy_path):
-        try:
-            import shutil
-            shutil.copy2(legacy_path, path)
-        except Exception:
-            pass
-    return path
 
 
 def default_credentials_path():
@@ -106,13 +89,11 @@ def logo_path():
     return os.path.join(app_base_dir(), "logo.png")
 
 
-def build_target_path(output_dir, item, source_name, use_group_folder=True):
+def build_target_path(output_dir, item, source_name):
     safe_source_name = sanitize_path_part(source_name or "file.jpg")
     if not extension_from_name(safe_source_name):
         safe_source_name += ".jpg"
-    if use_group_folder:
-        return os.path.join(output_dir, item.group_name, safe_source_name)
-    return os.path.join(output_dir, safe_source_name)
+    return os.path.join(output_dir, item.group_name, safe_source_name)
 
 
 class LinkHTMLParser(HTMLParser):
@@ -156,49 +137,6 @@ def source_name_from_url(url):
     return name if name and name != "file.jpg" else ""
 
 
-def is_drive_link(url):
-    try:
-        return urlparse(str(url or "")).hostname == "drive.google.com"
-    except Exception:
-        return False
-
-
-def should_group_by_prefix(group_mode):
-    mode_text = str(group_mode or "").lower()
-    return group_mode == "prefix" or "前缀" in mode_text or "ǰ׺" in mode_text
-
-
-def resolve_item_source_name(item, client, public_downloader):
-    source_name = "" if is_url_like(item.source_name) else (item.source_name or "")
-    folder_id = extract_drive_folder_id(item.url)
-    if folder_id:
-        folder_name, _ = client.list_drive_folder_files(folder_id)
-        return source_name or folder_name
-
-    file_id, _ = extract_drive_file_info(item.url)
-    if file_id:
-        return client.get_drive_file_name(file_id)
-
-    if item.url:
-        return source_name or public_downloader.prepare_name(item.url)
-    return source_name
-
-
-def item_with_resolved_source(item, source_name, group_mode):
-    display_name = source_name or item.title or f"粘贴链接-{item.row_number}"
-    group_basis = display_name if should_group_by_prefix(group_mode) else (item.title or display_name)
-    group_name, file_number = parse_title(group_basis, item.row_number, group_mode)
-    return DownloadItem(
-        item.row_number,
-        item.title or display_name,
-        item.url,
-        source_name,
-        item.match_name,
-        group_name,
-        file_number,
-    )
-
-
 def parse_pasted_links(plain_text, html_text, group_mode, keyword=""):
     records = []
 
@@ -230,28 +168,13 @@ def parse_pasted_links(plain_text, html_text, group_mode, keyword=""):
         if url in seen:
             continue
         seen.add(url)
-        source_name = "" if is_url_like(title) else (title or source_name_from_url(url))
+        source_name = title or source_name_from_url(url)
         display_name = source_name or f"粘贴链接-{index}"
         if keyword_text and keyword_text not in display_name.lower() and keyword_text not in url.lower():
             continue
         group_name, file_number = parse_title(display_name, index, group_mode)
         items.append(DownloadItem(index, display_name, url, source_name, "", group_name, file_number))
     return items
-
-
-def resolve_pasted_item_names(items, group_mode, make_client, log_func, stop_event=None):
-    resolved = []
-    client = None
-    public_downloader = PublicDownloader()
-    log_func(f"正在读取粘贴链接的真实文件名，共 {len(items)} 条...")
-    for item in items:
-        if stop_event is not None and stop_event.is_set():
-            break
-        if client is None and item.url and (is_drive_link(item.url) or extract_drive_folder_id(item.url)):
-            client = make_client()
-        source_name = resolve_item_source_name(item, client, public_downloader) if client else (item.source_name or "")
-        resolved.append(item_with_resolved_source(item, source_name, group_mode))
-    return resolved, client
 
 
 class WorkerBase(QThread):
@@ -305,18 +228,6 @@ class PreviewWorker(WorkerBase):
                         self.log.emit(f"已刷新结束行：{info.row_count}")
                         break
             items = client.read_items(**settings)
-            public_downloader = PublicDownloader()
-            resolved_items = []
-            group_mode = settings.get("group_mode") or ""
-            for item in items:
-                if item.url and item.url.startswith("http"):
-                    try:
-                        source_name = resolve_item_source_name(item, client, public_downloader)
-                        item = item_with_resolved_source(item, source_name, group_mode)
-                    except Exception as exc:
-                        self.log.emit(f"第 {item.row_number} 行读取源文件名失败：{exc}")
-                resolved_items.append(item)
-            items = resolved_items
             rows = []
             for item in items[:500]:
                 rows.append({
@@ -333,37 +244,6 @@ class PreviewWorker(WorkerBase):
             self.log.emit(f"预览完成：匹配 {len(items)} 行，其中 {link_count} 行有链接。")
         except Exception as exc:
             self.failed.emit(f"预览失败：{exc}")
-
-
-class PastedPreviewWorker(WorkerBase):
-    preview_ready = Signal(list, list)
-
-    def __init__(self, credentials_path, token_path, items, group_mode):
-        super().__init__(credentials_path, token_path)
-        self.items = items
-        self.group_mode = group_mode
-
-    def run(self):
-        try:
-            items, _ = resolve_pasted_item_names(
-                self.items,
-                self.group_mode,
-                self.make_client,
-                self.log.emit,
-            )
-            rows = [{
-                "row_number": item.row_number,
-                "folder": item.group_name,
-                "title": item.title,
-                "source_name": item.source_name,
-                "match_name": item.match_name,
-                "url": item.url,
-                "has_link": item.url.startswith("http"),
-            } for item in items[:500]]
-            self.preview_ready.emit(rows, items)
-            self.log.emit(f"粘贴预览完成：已读取 {len(items)} 条真实文件名。")
-        except Exception as exc:
-            self.failed.emit(f"粘贴预览失败：{exc}")
 
 
 class DownloadWorker(WorkerBase):
@@ -413,13 +293,6 @@ class DownloadWorker(WorkerBase):
             public_downloader = PublicDownloader()
             if self.pasted_items is not None:
                 items = list(self.pasted_items)
-                items, client = resolve_pasted_item_names(
-                    items,
-                    self.settings.get("group_mode") or "按人名",
-                    self.make_client,
-                    self.log.emit,
-                    self.stop_event,
-                )
             else:
                 client = self.make_client()
                 settings = dict(self.settings)
@@ -431,7 +304,6 @@ class DownloadWorker(WorkerBase):
                             self.log.emit(f"已刷新结束行：{info.row_count}")
                             break
                 items = client.read_items(**settings)
-            group_counts = Counter(item.group_name for item in items if item.group_name)
             self.log.emit(f"准备下载 {len(items)} 行。")
 
             for item in items:
@@ -444,58 +316,18 @@ class DownloadWorker(WorkerBase):
                     self.log.emit(f"第 {item.row_number} 行跳过：没有链接")
                     continue
 
-                if False and re.search(r"drive\.google\.com/(?:drive/(?:u/\d+/)?folders|folderview)", item.url, re.I):
+                if re.search(r"drive\.google\.com/(?:drive/(?:u/\d+/)?folders|folderview)", item.url, re.I):
                     skipped += 1
                     self.log.emit(f"第 {item.row_number} 行跳过：文件夹链接")
                     continue
 
                 try:
-                    folder_id = extract_drive_folder_id(item.url)
-                    if folder_id:
-                        if client is None:
-                            client = self.make_client()
-                        folder_name, folder_files = client.list_drive_folder_files(folder_id)
-                        folder_group = item.group_name
-                        if not folder_group or group_counts.get(folder_group, 0) <= 1:
-                            folder_group = sanitize_path_part(folder_name)
-                        folder_item = DownloadItem(
-                            item.row_number,
-                            item.title or folder_name,
-                            item.url,
-                            item.source_name,
-                            item.match_name,
-                            folder_group,
-                            item.file_number,
-                        )
-                        self.log.emit(f"Drive 文件夹：{folder_name}，发现 {len(folder_files)} 个项目")
-                        for folder_file in folder_files:
-                            if self.stop_event.is_set():
-                                self.log.emit("任务已停止")
-                                break
-                            if folder_file.get("mimeType") == "application/vnd.google-apps.folder":
-                                skipped += 1
-                                self.log.emit(f"跳过子文件夹：{folder_file.get('name') or folder_file.get('id')}")
-                                continue
-                            source_name = folder_file.get("name") or "file"
-                            target_path = build_target_path(self.output_dir, folder_item, source_name, True)
-                            if self.skip_existing and os.path.exists(target_path):
-                                skipped += 1
-                                self.log.emit(f"已存在，跳过：{target_path}")
-                                continue
-                            saved_path = client.download_drive_file(folder_file["id"], unique_path(target_path), self.stop_event)
-                            success += 1
-                            self.log.emit(f"成功：{saved_path}")
-                            self.progress.emit({"success": success, "skipped": skipped, "failed": failed})
-                            time.sleep(0.08)
-                        continue
-
                     file_id, _ = extract_drive_file_info(item.url)
                     if file_id:
                         if client is None:
                             client = self.make_client()
-                        source_name = "" if is_url_like(item.source_name) else item.source_name
-                        source_name = source_name or client.get_drive_file_name(file_id)
-                        target_path = build_target_path(self.output_dir, item, source_name, group_counts.get(item.group_name, 0) > 1)
+                        source_name = item.source_name or client.get_drive_file_name(file_id)
+                        target_path = build_target_path(self.output_dir, item, source_name)
                         if self.skip_existing and os.path.exists(target_path):
                             skipped += 1
                             self.log.emit(f"已存在，跳过：{target_path}")
@@ -503,9 +335,8 @@ class DownloadWorker(WorkerBase):
                             continue
                         saved_path = client.download_drive_file(file_id, unique_path(target_path), self.stop_event)
                     else:
-                        source_name = "" if is_url_like(item.source_name) else item.source_name
-                        source_name = source_name or public_downloader.prepare_name(item.url)
-                        target_path = build_target_path(self.output_dir, item, source_name, group_counts.get(item.group_name, 0) > 1)
+                        source_name = item.source_name or public_downloader.prepare_name(item.url)
+                        target_path = build_target_path(self.output_dir, item, source_name)
                         if self.skip_existing and os.path.exists(target_path):
                             skipped += 1
                             self.log.emit(f"已存在，跳过：{target_path}")
@@ -548,7 +379,6 @@ class Card(QFrame):
 class PasteLinksDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setObjectName("pasteDialog")
         self.setWindowTitle("粘贴链接")
         self.resize(760, 520)
         self.action = ""
@@ -558,18 +388,13 @@ class PasteLinksDialog(QDialog):
         layout.setSpacing(10)
 
         tip = QLabel("支持从表格复制的超链接、HTML 链接、纯文本 URL。粘贴链接下载不需要填写表格 ID 和回填列。")
-        tip.setObjectName("pasteTip")
+        tip.setObjectName("subtitle")
         layout.addWidget(tip)
 
         self.text_box = QTextEdit()
         self.text_box.setObjectName("pasteTextBox")
         self.text_box.setAcceptRichText(True)
         self.text_box.setPlaceholderText("在这里粘贴链接，例如：\n张三-文件名.mp4  https://drive.google.com/file/d/...\n或直接从 Google 表格复制带超链接的单元格。")
-        palette = self.text_box.palette()
-        palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#5f6f86"))
-        palette.setColor(QPalette.ColorRole.Text, QColor("#132238"))
-        palette.setColor(QPalette.ColorRole.Base, QColor("#f8fbff"))
-        self.text_box.setPalette(palette)
         layout.addWidget(self.text_box, 1)
 
         buttons = QHBoxLayout()
@@ -616,6 +441,46 @@ class PasteLinksDialog(QDialog):
         return self.text_box.toHtml()
 
 
+class UpdateCheckWorker(QThread):
+    found = Signal(object)
+    none = Signal()
+    failed = Signal(str)
+
+    def __init__(self, silent=False):
+        super().__init__()
+        self.silent = silent
+
+    def run(self):
+        try:
+            info = check_for_update()
+            if info:
+                self.found.emit(info)
+            else:
+                self.none.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class UpdateDownloadWorker(QThread):
+    progress = Signal(int, int)
+    finished_path = Signal(str, object)
+    failed = Signal(str)
+
+    def __init__(self, release_info):
+        super().__init__()
+        self.release_info = release_info
+
+    def run(self):
+        try:
+            path = download_release(
+                self.release_info,
+                progress_callback=lambda d, t: self.progress.emit(d, t),
+            )
+            self.finished_path.emit(path, self.release_info)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -627,16 +492,20 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1120, 760)
         self.sheet_rows = {}
         self.worker = None
+        self.update_worker = None
         self.config_queue = []
         self.running_all_configs = False
         self.preview_pasted_items = []
-        self.token_file_path = state_file_path("token.json")
-        self.config_file_path = state_file_path("diy_downloader_configs.json")
+        self.token_file_path = os.path.join(app_base_dir(), "token.json")
+        self.config_file_path = os.path.join(app_base_dir(), "diy_downloader_configs.json")
         self.configs = {}
+        self.pending_release = None
 
         self.build_ui()
         self.apply_style()
         self.load_configs()
+        # 启动后静默检查更新
+        self.schedule_startup_update_check()
 
     def build_ui(self):
         root = QWidget()
@@ -650,9 +519,9 @@ class MainWindow(QMainWindow):
         header.setSpacing(10)
         root_layout.addLayout(header)
 
-        title = QLabel("DIY下载器")
+        title = QLabel(APP_NAME)
         title.setObjectName("title")
-        subtitle = QLabel("读取 Google 表格链接，按名称建文件夹，下载成功后可回填表格。")
+        subtitle = QLabel(f"v{APP_VERSION} · 表格/粘贴链接 · YouTube/FB 视频 · 自动更新")
         subtitle.setObjectName("subtitle")
         title_box = QVBoxLayout()
         title_box.setSpacing(1)
@@ -662,13 +531,29 @@ class MainWindow(QMainWindow):
 
         self.theme_check = QCheckBox("暗黑模式")
         self.theme_check.setChecked(True)
+        self.update_btn = QPushButton("检查更新")
+        self.update_btn.setObjectName("secondaryButton")
         self.guide_btn = QPushButton("使用说明")
         self.guide_btn.setObjectName("ghostButton")
         self.help_btn = QPushButton("查看帮助")
         self.help_btn.setObjectName("ghostButton")
         header.addWidget(self.theme_check)
+        header.addWidget(self.update_btn)
         header.addWidget(self.guide_btn)
         header.addWidget(self.help_btn)
+
+        self.main_tabs = QTabWidget()
+        self.main_tabs.setObjectName("mainTabs")
+        root_layout.addWidget(self.main_tabs, 1)
+
+        sheets_page = QWidget()
+        sheets_layout = QVBoxLayout(sheets_page)
+        sheets_layout.setContentsMargins(12, 12, 12, 12)
+        sheets_layout.setSpacing(10)
+        self.main_tabs.addTab(sheets_page, "表格 / 粘贴链接")
+
+        self.video_page = VideoBatchPage()
+        self.main_tabs.addTab(self.video_page, "YouTube / FB 视频")
 
         compact_panel = QFrame()
         compact_panel.setObjectName("compactPanel")
@@ -676,7 +561,7 @@ class MainWindow(QMainWindow):
         panel_layout.setContentsMargins(14, 12, 14, 12)
         panel_layout.setHorizontalSpacing(10)
         panel_layout.setVerticalSpacing(8)
-        root_layout.addWidget(compact_panel)
+        sheets_layout.addWidget(compact_panel)
 
         self.credentials_edit = QLineEdit(default_credentials_path())
         self.output_edit = QLineEdit(os.path.join(os.path.expanduser("~"), "Downloads", "批量下载"))
@@ -752,7 +637,7 @@ class MainWindow(QMainWindow):
 
         actions = QHBoxLayout()
         actions.setSpacing(8)
-        root_layout.addLayout(actions)
+        sheets_layout.addLayout(actions)
         self.refresh_btn = QPushButton("刷新表格")
         self.refresh_btn.setObjectName("secondaryButton")
         self.preview_btn = QPushButton("预览读取")
@@ -779,7 +664,7 @@ class MainWindow(QMainWindow):
 
         bottom = QHBoxLayout()
         bottom.setSpacing(10)
-        root_layout.addLayout(bottom, 4)
+        sheets_layout.addLayout(bottom, 4)
         preview_card = Card("预览")
         log_card = Card("日志")
         bottom.addWidget(preview_card, 7)
@@ -808,7 +693,7 @@ class MainWindow(QMainWindow):
 
         self.status_row = QLabel("等待开始")
         self.status_row.setObjectName("status")
-        root_layout.addWidget(self.status_row)
+        sheets_layout.addWidget(self.status_row)
 
         self.preview_btn.clicked.connect(self.preview_items)
         self.refresh_btn.clicked.connect(self.refresh_sheet_info)
@@ -819,6 +704,7 @@ class MainWindow(QMainWindow):
         self.clear_log_btn.clicked.connect(self.log_box.clear)
         self.guide_btn.clicked.connect(self.show_usage_guide)
         self.help_btn.clicked.connect(self.show_help)
+        self.update_btn.clicked.connect(lambda: self.check_updates(silent=False))
         self.theme_check.toggled.connect(self.apply_style)
         self.sheet_combo.currentTextChanged.connect(self.sync_sheet_end_row)
         self.config_combo.currentTextChanged.connect(self.apply_selected_config)
@@ -1028,20 +914,14 @@ class MainWindow(QMainWindow):
             QTextEdit {{ background: {colors["log"]}; color: #66f5a1; border: 1px solid {colors["line"]}; border-radius: 12px; padding: 10px; font-family: Consolas, "Microsoft YaHei UI"; font-size: 12px; }}
             QTextEdit#pasteTextBox {{ background: {colors["panel2"]}; color: {colors["text"]}; border: 1px solid {colors["line"]}; border-radius: 12px; padding: 10px; font-family: "Microsoft YaHei UI", "Microsoft YaHei", Arial, sans-serif; font-size: 13px; }}
             QLabel#status {{ color: {colors["muted"]}; font-weight: 800; }}
+            QTabWidget#mainTabs {{ background: transparent; }}
+            QTabWidget#mainTabs::pane {{ border: 1px solid {colors["line"]}; border-radius: 12px; top: -1px; background: {colors["panel"]}; }}
+            QTabWidget#mainTabs QTabBar::tab {{ background: {colors["soft"]}; color: {colors["muted"]}; border: 1px solid {colors["line"]}; border-bottom: 0; border-top-left-radius: 10px; border-top-right-radius: 10px; padding: 8px 18px; margin-right: 4px; font-weight: 800; min-width: 120px; }}
+            QTabWidget#mainTabs QTabBar::tab:selected {{ background: {colors["panel"]}; color: {colors["title"]}; border-color: {colors["accent2"]}; }}
+            QTabWidget#mainTabs QTabBar::tab:hover {{ color: {colors["title"]}; border-color: {colors["accent2"]}; }}
             QMessageBox {{ background: {colors["dialog_bg"]}; color: {colors["dialog_text"]}; font-family: "Microsoft YaHei UI", "Microsoft YaHei", Arial, sans-serif; }}
             QMessageBox QLabel {{ color: {colors["dialog_text"]}; background: transparent; font-size: 13px; }}
             QMessageBox QPushButton {{ background: {colors["accent"]}; color: #ffffff; border-radius: 9px; padding: 6px 16px; min-width: 64px; }}
-            QDialog#pasteDialog {{ background: #f8fafc; color: #172033; font-family: "Microsoft YaHei UI", "Microsoft YaHei", Arial, sans-serif; }}
-            QDialog#pasteDialog QLabel#pasteTip {{ color: #48617f; background: transparent; font-size: 13px; font-weight: 600; }}
-            QDialog#pasteDialog QTextEdit#pasteTextBox {{ background: #f8fbff; color: #132238; border: 1px solid #b9cbe3; border-radius: 12px; padding: 12px; font-family: "Microsoft YaHei UI", "Microsoft YaHei", Arial, sans-serif; font-size: 14px; selection-background-color: #2563eb; selection-color: #ffffff; }}
-            QDialog#pasteDialog QTextEdit#pasteTextBox:focus {{ border: 1px solid #2563eb; background: #ffffff; }}
-            QDialog#pasteDialog QPushButton {{ background: #2563eb; color: #ffffff; border: 0; border-radius: 10px; padding: 8px 18px; font-weight: 800; min-height: 28px; }}
-            QDialog#pasteDialog QPushButton:hover {{ background: #1d4ed8; }}
-            QDialog#pasteDialog QPushButton#secondaryButton {{ background: #eaf3ff; color: #12345f; border: 1px solid #9fbce2; }}
-            QDialog#pasteDialog QPushButton#secondaryButton:hover {{ background: #dbeafe; border: 1px solid #2563eb; }}
-            QDialog#pasteDialog QPushButton#ghostButton {{ background: #ffffff; color: #334155; border: 1px solid #b9cbe3; }}
-            QDialog#pasteDialog QPushButton#ghostButton:hover {{ background: #f1f5f9; color: #0f172a; border: 1px solid #64748b; }}
-            QDialog#pasteDialog QPushButton:disabled {{ background: #eef2f7; color: #64748b; border: 1px solid #cbd5e1; }}
             QScrollBar:vertical, QScrollBar:horizontal {{ background: transparent; width: 10px; height: 10px; }}
             QScrollBar::handle:vertical, QScrollBar::handle:horizontal {{ background: {colors["line"]}; border-radius: 5px; min-height: 30px; min-width: 30px; }}
             QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
@@ -1074,6 +954,7 @@ class MainWindow(QMainWindow):
             self,
             APP_TITLE,
             "使用步骤：\n"
+            "【表格 / 粘贴链接】\n"
             "1. 选择凭据文件和下载目录。\n"
             "2. 填写 Google 表格 ID，点击“加载工作表”或“刷新表格”。\n"
             "3. 设置名称列、链接列、起止行、文件夹命名和回填列。\n"
@@ -1082,7 +963,15 @@ class MainWindow(QMainWindow):
             "6. 也可以点“粘贴链接下载”，粘贴从表格复制的超链接或纯文本链接；这种方式不需要表格 ID 和回填列。\n"
             "   粘贴预览后，主界面的“开始下载”会直接下载当前预览里的粘贴链接。\n"
             "   没有填写表格 ID 时，直接点“开始下载”也会进入粘贴链接下载。\n"
-            "7. 多个保存方案可以点“执行所有方案”按顺序自动下载。"
+            "7. 多个保存方案可以点“执行所有方案”按顺序自动下载。\n\n"
+            "【YouTube / FB 视频】（独立板块）\n"
+            "1. 切换到“YouTube / FB 视频”标签页。\n"
+            "2. 粘贴单视频、播放列表或多个链接（支持批量）。\n"
+            "3. 选择下载模式：自动识别 / 仅单视频 / 展开播放列表。\n"
+            "4. 可开启断点续传、列表分子文件夹、列表上限。\n"
+            "5. 可直接点“开始下载”：会自动加载视频/播放列表，无需先解析。\n"
+            "6. “解析预览”可选，只用于提前查看列表。\n"
+            "7. 建议安装 ffmpeg，以便最佳画质音视频合并。"
         )
 
     def show_help(self):
@@ -1097,7 +986,10 @@ class MainWindow(QMainWindow):
             "• 下载成功后可把匹配到的人名写入 Q 列，失败不会写入。\n"
             "• 勾选“扫描整个工作表”时，预览和下载都会自动刷新最新结束行。\n"
             "• 勾选“已下载过则跳过”时，本地已有同名文件会跳过。\n"
-            "• 如果回填提示权限不足，删除 token.json 后重新授权即可。"
+            "• 如果回填提示权限不足，删除 token.json 后重新授权即可。\n"
+            "• YouTube / Facebook 视频板块基于 yt-dlp，与表格下载相互独立。\n"
+            "• 支持 YouTube 单视频与播放列表、批量多链接、断点续传。\n"
+            "• Facebook 公开 Reels/视频可下载；可识别的清单会尝试展开，私密内容会失败。"
         )
 
     def refresh_sheet_info(self):
@@ -1131,21 +1023,6 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, APP_TITLE, "没有解析到可下载链接。请确认粘贴内容里包含 http/https 链接。")
             return
         if dialog.action == "preview":
-            self.set_running_state(True)
-            self.status_row.setText("正在读取粘贴链接的真实文件名...")
-            worker = PastedPreviewWorker(
-                self.credentials_edit.text(),
-                self.token_file_path,
-                items,
-                self.folder_mode_combo.currentText(),
-            )
-            worker.log.connect(self.log)
-            worker.failed.connect(self.show_error)
-            worker.preview_ready.connect(self.on_pasted_preview_ready)
-            worker.finished.connect(self.on_pasted_preview_finished)
-            self.worker = worker
-            worker.start()
-            return
             self.preview_pasted_items = list(items)
             self.fill_preview(self.items_to_preview_rows(items[:500]))
             link_count = sum(1 for item in items if item.url.startswith("http"))
@@ -1153,18 +1030,6 @@ class MainWindow(QMainWindow):
             self.log(f"粘贴预览完成：解析 {len(items)} 行，其中 {link_count} 行有链接。可直接点击“开始下载”。")
             return
         self.start_pasted_download(items)
-
-    def on_pasted_preview_ready(self, rows, items):
-        self.preview_pasted_items = list(items)
-        self.fill_preview(rows)
-        link_count = sum(1 for item in items if item.url.startswith("http"))
-        self.status_row.setText(f"粘贴预览完成：显示 {len(rows)} 行，可直接点开始下载")
-        self.log(f"粘贴预览完成：读取真实文件名 {len(items)} 条，其中 {link_count} 条有链接。")
-
-    def on_pasted_preview_finished(self):
-        if self.sender() is self.worker:
-            self.worker = None
-        self.set_running_state(False)
 
     def start_pasted_download(self, items):
         output_dir = self.output_edit.text().strip()
@@ -1178,7 +1043,7 @@ class MainWindow(QMainWindow):
         worker = DownloadWorker(
             self.credentials_edit.text(),
             self.token_file_path,
-            {"group_mode": self.folder_mode_combo.currentText()},
+            {},
             output_dir,
             self.skip_existing_check.isChecked(),
             False,
@@ -1412,6 +1277,10 @@ class MainWindow(QMainWindow):
                 self.status_row.setText("任务仍在停止中，请稍后再关闭")
                 self.log("任务仍在停止中，已取消关闭窗口。")
                 return
+        if hasattr(self, "video_page") and not self.video_page.request_close():
+            event.ignore()
+            self.log("视频下载任务仍在停止中，已取消关闭窗口。")
+            return
         event.accept()
 
     def on_progress(self, stats):
@@ -1438,6 +1307,126 @@ class MainWindow(QMainWindow):
         self.log(message)
         self.status_row.setText("出现错误")
         QMessageBox.warning(self, APP_TITLE, message)
+
+    def schedule_startup_update_check(self):
+        # 延迟一点，避免抢启动 UI
+        try:
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(2500, lambda: self.check_updates(silent=True))
+        except Exception:
+            self.check_updates(silent=True)
+
+    def check_updates(self, silent=False):
+        if self.update_worker and self.update_worker.isRunning():
+            if not silent:
+                QMessageBox.information(self, APP_TITLE, "正在检查更新，请稍候。")
+            return
+        if not silent:
+            self.status_row.setText("正在检查更新...")
+            self.log(f"正在检查更新（当前 v{APP_VERSION}）...")
+            self.update_btn.setEnabled(False)
+        worker = UpdateCheckWorker(silent=silent)
+        worker.found.connect(lambda info, s=silent: self.on_update_found(info, silent=s))
+        worker.none.connect(lambda s=silent: self.on_update_none(silent=s))
+        worker.failed.connect(lambda msg, s=silent: self.on_update_failed(msg, silent=s))
+        worker.finished.connect(lambda: self.update_btn.setEnabled(True))
+        self.update_worker = worker
+        worker.start()
+
+    def on_update_none(self, silent=False):
+        if silent:
+            return
+        self.status_row.setText(f"已是最新版本 v{APP_VERSION}")
+        self.log(f"已是最新版本 v{APP_VERSION}")
+        QMessageBox.information(
+            self,
+            APP_TITLE,
+            f"当前已是最新版本 v{APP_VERSION}。\n\n发布页：{RELEASES_PAGE}",
+        )
+
+    def on_update_failed(self, message, silent=False):
+        self.log(f"检查更新失败：{message}")
+        if silent:
+            return
+        self.status_row.setText("检查更新失败")
+        QMessageBox.warning(self, APP_TITLE, f"检查更新失败：\n{message}\n\n可手动打开：\n{RELEASES_PAGE}")
+
+    def on_update_found(self, info, silent=False):
+        self.pending_release = info
+        size_text = format_size(info.asset_size)
+        kind = "安装包" if info.is_installer else "便携版"
+        notes = (info.body or "").strip()
+        if len(notes) > 600:
+            notes = notes[:600] + "..."
+        msg = (
+            f"发现新版本 v{info.version}（当前 v{APP_VERSION}）\n\n"
+            f"文件：{info.asset_name}（{kind}，{size_text}）\n\n"
+        )
+        if notes:
+            msg += f"更新说明：\n{notes}\n\n"
+        msg += "是否下载更新？"
+        self.status_row.setText(f"发现新版本 v{info.version}")
+        self.log(f"发现新版本 v{info.version}：{info.asset_name}")
+        if QMessageBox.question(self, APP_TITLE, msg) != QMessageBox.StandardButton.Yes:
+            self.log("用户取消下载更新。")
+            return
+        self.start_update_download(info)
+
+    def start_update_download(self, info):
+        self.update_btn.setEnabled(False)
+        self.status_row.setText(f"正在下载更新 v{info.version}...")
+        self.log(f"开始下载更新：{info.asset_url}")
+        worker = UpdateDownloadWorker(info)
+        worker.progress.connect(self.on_update_download_progress)
+        worker.finished_path.connect(self.on_update_downloaded)
+        worker.failed.connect(self.on_update_download_failed)
+        worker.finished.connect(lambda: self.update_btn.setEnabled(True))
+        self.update_worker = worker
+        worker.start()
+
+    def on_update_download_progress(self, downloaded, total):
+        if total:
+            pct = int(downloaded * 100 / total)
+            self.status_row.setText(f"下载更新 {pct}%（{format_size(downloaded)} / {format_size(total)}）")
+
+    def on_update_download_failed(self, message):
+        self.log(f"下载更新失败：{message}")
+        self.status_row.setText("下载更新失败")
+        QMessageBox.warning(self, APP_TITLE, f"下载更新失败：\n{message}")
+
+    def on_update_downloaded(self, path, info):
+        self.log(f"更新已下载：{path}")
+        self.status_row.setText(f"更新已下载 v{info.version}")
+        kind = "安装程序" if info.is_installer else "新版本程序"
+        reply = QMessageBox.question(
+            self,
+            APP_TITLE,
+            f"新版本 v{info.version} 已下载完成。\n\n"
+            f"文件：{path}\n\n"
+            f"是否立即运行{kind}进行安装/替换？\n"
+            f"（便携版会自动替换并重启；安装包会打开安装向导）",
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            self.log("用户选择稍后安装。")
+            QMessageBox.information(self, APP_TITLE, f"已保存到：\n{path}\n\n可稍后手动运行安装。")
+            return
+        try:
+            launch_installer_or_replace(path, info.is_installer)
+            self.log("已启动安装/替换流程，程序即将退出。")
+            if getattr(sys, "frozen", False) and not info.is_installer:
+                QApplication.instance().quit()
+            elif info.is_installer:
+                # 安装包启动后建议退出，避免文件占用
+                tip = QMessageBox.question(
+                    self,
+                    APP_TITLE,
+                    "安装程序已启动。\n是否退出当前程序以便完成安装？",
+                )
+                if tip == QMessageBox.StandardButton.Yes:
+                    QApplication.instance().quit()
+        except Exception as exc:
+            self.log(f"启动安装失败：{exc}")
+            QMessageBox.warning(self, APP_TITLE, f"启动安装失败：\n{exc}\n\n请手动运行：\n{path}")
 
 
 def main():

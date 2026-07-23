@@ -1,77 +1,156 @@
 # DIY下载器
 
-DIY下载器是一个 Windows 本地批量下载工具，用于从 Google 表格或手动粘贴的链接中读取 Google Drive 文件，并按规则自动命名、分组和下载。
+一个用于从 Google 表格读取链接并批量下载文件的本地客户端。
 
 ## 主要功能
 
-- 支持读取 Google 表格指定工作表，默认按 `A` 列判断系列/文件夹，按 `P` 列读取真实链接。
-- 支持自定义名称列、链接列、回填列、起始行、结束行和筛选关键词。
-- 支持粘贴链接下载，可兼容 Google 表格复制出来的超链接、HTML 链接和纯文本 URL。
-- 粘贴链接预览时会先读取 Google Drive 真实文件名，预览后点击“开始下载”会直接下载当前预览内容。
-- 支持 Google Drive 文件夹链接，检测到文件夹后会读取文件夹内文件并下载。
-- 自动判断是否创建系列文件夹：同系列文件较多时创建文件夹，单独文件直接下载到所选目录。
-- 文件下载后使用源文件名保存，不再使用行号命名。
-- 支持已下载文件跳过、任务停止、打开下载文件夹、清空日志。
-- 支持下载成功后回填名称到表格，默认回填 `Q` 列，失败不会写入。
-- 支持多个配置方案保存、切换和按顺序执行。
-- 支持浅色/深色模式切换。
-- 授权 token 会保存在用户配置目录，已授权过的账号通常不需要每次重新授权。
+- 读取 Google 表格指定工作表。
+- 默认按 `A` 列名称创建文件夹，按 `P` 列链接下载源文件。
+- 支持筛选“只下载包含”的人名或组合名。
+- 支持下载成功后回填到指定列，默认 `Q` 列。
+- 支持跳过本地已存在文件。
+- 支持保存多个配置方案，并一键按顺序执行所有方案。
+- 支持暗黑模式切换、预览、停止、打开下载文件夹。
+- 支持直接粘贴链接下载：兼容从表格复制的 HTML 超链接和纯文本 URL。
+- **独立板块：YouTube / Facebook 视频批量下载**（基于 `yt-dlp`，与表格下载互不影响）。
+- **自动检查更新**：启动静默检查 GitHub Release，可一键下载并提示是否安装。
 
-## 使用方法
+## 下载安装（推荐）
 
-1. 准备 Google OAuth 凭据或服务账号 JSON 文件。
-2. 打开程序，选择凭据文件和下载目录。
-3. 使用表格模式时，填写 Google 表格 ID，点击“加载工作表”，选择对应工作表后预览或下载。
-4. 使用粘贴模式时，点击“粘贴链接下载”，从剪贴板读取或手动粘贴链接，先预览再下载。
-5. 如果勾选“下载成功后回填表格”，成功下载后会把匹配到的名称写入指定回填列。
+到 [Releases](https://github.com/secure-artifacts/DIY-sheets_batch_downloader/releases) 下载：
 
-## 授权说明
+| 文件 | 说明 |
+|------|------|
+| `DIYDownloader-v*-windows-setup.exe` | **Windows 可安装版**（推荐） |
+| `DIYDownloader-v*-windows.exe` | Windows 便携版（绿色运行） |
+| `DIYDownloader-v*-macos.zip` | macOS 应用包 |
 
-程序会优先复用已经授权过的 token。默认保存位置：
+安装版会创建开始菜单/桌面快捷方式；后续有新版本时，打开软件点 **检查更新**，下载完成后会询问是否安装。
 
-```text
-C:\Users\当前用户\AppData\Roaming\DIY下载器\token.json
+## 安装依赖
+
+```powershell
+pip install -r requirements_google.txt
 ```
 
-如果使用同一个公用邮箱授权，并且权限范围没有变化，复制或保留该 token 后通常不需要每个人都重新授权。
+## 运行
 
-注意：`token.json` 等同于授权凭据，不要上传到公开仓库。
+```powershell
+python sheets_batch_downloader_modern.py
+```
 
-## 安全文件
+## 粘贴链接下载
 
-请不要把以下本地文件上传到公开仓库：
+点击界面里的 `粘贴链接下载`，可以粘贴：
+
+- 从 Google 表格复制的超链接单元格。
+- HTML `<a href="...">文件名</a>` 格式。
+- 普通纯文本链接，例如 `张三 https://drive.google.com/file/d/...`。
+
+粘贴后可以先预览，也可以直接下载。纯 Drive 链接没有显示文件名时，程序会通过 Drive API 获取真实文件名。
+
+粘贴链接下载不需要填写表格 ID、工作表或回填列；这些配置只用于 Google 表格读取模式。粘贴链接下载不会回填表格。
+
+没有填写表格 ID 或没有选择工作表时，点击主界面的 `开始下载` 会自动进入粘贴链接下载模式。
+
+如果已经点击 `预览粘贴` 并把链接显示在预览表格里，再点击主界面的 `开始下载`，会直接下载当前预览表格里的这批粘贴链接。
+
+## YouTube / Facebook 视频批量下载
+
+切换到界面顶部的 **「YouTube / FB 视频」** 标签页：
+
+1. 粘贴一条或多条链接（支持混贴文本自动提取 URL，支持批量）。
+2. 选择下载目录、画质、下载模式。
+3. **直接点「开始下载」即可**：会自动加载单视频/展开播放列表并开始下载，无需先解析。
+4. 「解析预览」为可选，只用于提前查看列表内容。
+5. 支持断点续传：中途停止或失败后保留临时文件，再次开始可继续。
+
+### 下载模式
+
+| 模式 | 行为 |
+|------|------|
+| **自动识别（推荐）** | YouTube 真实播放列表（`PL`/`UU` 等）整表下载；电台混播（`RD`）只下当前视频；FB 单条 Reels/视频按单条处理 |
+| **仅单视频** | 忽略列表参数，只下载当前视频 |
+| **展开播放列表/清单** | 强制展开 YouTube 播放列表，以及 Facebook 可识别的清单/合集 |
+
+其他选项：
+
+- **断点续传**：默认开启（yt-dlp `.part` 续传）。
+- **已完成则跳过**：本地已有完整文件时跳过。
+- **播放列表分子文件夹**：每个列表一个子目录，文件名带序号 `001 - 标题 [id].ext`。
+- **列表上限**：限制单个播放列表最多展开多少条（0=不限制）。
+
+依赖：
+
+```powershell
+pip install yt-dlp
+```
+
+建议安装 [ffmpeg](https://ffmpeg.org/) 并加入 PATH，以便最佳画质下的音视频合并，以及仅音频导出 mp3。
+
+说明：
+
+- 与 Google 表格下载是独立板块，互不抢配置。
+- 公开的 YouTube / Facebook 视频一般可直接下载；需登录或隐私限制的内容可能失败。
+- Facebook Reels「播放清单」取决于链接是否公开且 yt-dlp 能解析为多条目；私密清单无法下载。
+- 其他 yt-dlp 支持的站点链接也可尝试解析下载。
+
+## Google 凭据
+
+程序需要 Google OAuth 客户端 JSON 文件或服务账号 JSON 文件。
+
+为了安全，仓库不要提交下面这些本地文件：
 
 - `token.json`
 - `谷歌服务账号.json`
 - `credentials.json`
 - `diy_downloader_configs.json`
-- 任何包含 Google、GitHub 或其它私密凭据的 JSON / env 文件
 
-## 本地运行
+首次运行时在界面里选择你的凭据文件即可。授权生成的 `token.json` 会保存在程序目录。
 
-```powershell
-pip install -r requirements_google.txt
-python sheets_batch_downloader_modern.py
-```
+## 自动更新
 
-## 下载版本
+1. 启动后约 2 秒会静默检查最新 GitHub Release。
+2. 也可点击右上角 **检查更新**。
+3. 发现新版本可下载；下载完成后询问是否立即安装。
+4. 安装包会打开安装向导；便携版会自动替换并重启。
 
-Release 页面会提供两个版本：
+## 打包 exe
 
-- Windows：`DIYDownloader-v版本号-windows.exe`
-- macOS：`DIYDownloader-v版本号-macos.zip`
-
-macOS 版本解压后是 `DIYDownloader.app`。首次打开时，如果系统提示来自互联网或未签名应用，可以在“系统设置 → 隐私与安全性”里允许打开。
-
-## GitHub 安全发布
-
-仓库已配置 `.github/workflows/release.yml`，发布方式为推送版本 tag：
+本地打包便携版：
 
 ```powershell
-git tag v1.0.1
-git push origin v1.0.1
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name "DIYDownloader" --icon "logo.ico" --add-data "assets;assets" --add-data "logo.png;." --hidden-import yt_dlp --collect-all yt_dlp sheets_batch_downloader_modern.py
 ```
 
-GitHub Actions 会在 `windows-latest` runner 上构建 Windows exe，在 `macos-latest` runner 上构建 macOS app 压缩包，生成 Artifact Attestation，并使用默认 `GITHUB_TOKEN` 创建 Release 和上传产物。
+不建议把包含凭据的 exe 或 JSON 上传到公开仓库。
 
-请不要手动在 GitHub Release 页面拖拽上传产物，否则平台的 L2 Attestation 校验可能失败。
+## GitHub Release / Attestation
+
+仓库已包含 `.github/workflows/release.yml`。
+
+发布方式：
+
+```powershell
+# 1. 修改 version.py 中的 APP_VERSION
+# 2. 更新 release_notes.md
+git add -A
+git commit -m "Release v1.1.0"
+git tag v1.1.0
+git push origin main
+git push origin v1.1.0
+```
+
+该 workflow 会：
+
+- 在 Windows runner 构建便携 exe + **Inno Setup 安装包**
+- 在 macOS runner 构建 app 压缩包
+- 生成 Artifact Attestation 并创建 Release
+
+产物：
+
+- `DIYDownloader-v*-windows-setup.exe`（可安装版）
+- `DIYDownloader-v*-windows.exe`（便携版）
+- `DIYDownloader-v*-macos.zip`
+
+不要手动在 GitHub Release 页面拖拽上传产物，否则严格 L2 Attestation 校验可能失败。

@@ -78,14 +78,6 @@ def to_drive_download_url(url: str):
     return direct
 
 
-def is_google_drive_url(url: str) -> bool:
-    try:
-        parsed = urlparse(str(url or ""))
-    except Exception:
-        return False
-    return parsed.hostname == "drive.google.com"
-
-
 def extension_from_name(name: str) -> str:
     base = os.path.basename(name or "")
     _, ext = os.path.splitext(base)
@@ -150,7 +142,7 @@ class Downloader:
             content_type = response.headers.get("Content-Type", "")
             content_disposition = response.headers.get("Content-Disposition", "")
 
-        if "text/html" in content_type.lower() and is_google_drive_url(download_url):
+        if "text/html" in content_type.lower() and "drive.google.com" in download_url:
             confirm_url = self._find_drive_confirm_url(data, download_url)
             if confirm_url:
                 with self.opener.open(self._request(confirm_url), timeout=60) as response:
@@ -158,7 +150,7 @@ class Downloader:
                     content_type = response.headers.get("Content-Type", "")
                     content_disposition = response.headers.get("Content-Disposition", "")
 
-        if "text/html" in content_type.lower() and is_google_drive_url(download_url):
+        if "text/html" in content_type.lower() and "drive.google.com" in download_url:
             raise RuntimeError("Drive 返回的是网页，不是文件。请确认链接公开可下载，或改用 Chrome 扩展使用当前浏览器登录状态。")
 
         remote_name = filename_from_content_disposition(content_disposition)

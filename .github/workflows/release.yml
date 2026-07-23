@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 permissions:
   id-token: write
@@ -22,7 +22,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
       - name: Install dependencies
         shell: pwsh
@@ -30,6 +30,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements_google.txt
           pip install pyinstaller
+
+      - name: Read app version
+        id: ver
+        shell: pwsh
+        run: |
+          $raw = Get-Content "version.py" -Raw
+          if ($raw -match 'APP_VERSION\s*=\s*"([^"]+)"') {
+            $v = $Matches[1]
+          } else {
+            $v = "${{ github.ref_name }}".TrimStart("v")
+          }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "APP_VERSION=$v"
 
       - name: Build Windows exe
         shell: pwsh
@@ -43,16 +56,52 @@ jobs:
             --icon "logo.ico" `
             --add-data "assets;assets" `
             --add-data "logo.png;." `
+            --add-data "logo.ico;." `
+            --hidden-import "yt_dlp" `
+            --collect-all "yt_dlp" `
+            --hidden-import "version" `
+            --hidden-import "updater" `
+            --hidden-import "video_batch_downloader" `
             "sheets_batch_downloader_modern.py"
 
           New-Item -ItemType Directory -Force -Path "release" | Out-Null
-          Copy-Item "dist/DIYDownloader.exe" "release/DIYDownloader-${{ github.ref_name }}-windows.exe"
+          $tag = "${{ github.ref_name }}"
+          Copy-Item "dist/DIYDownloader.exe" "release/DIYDownloader-$tag-windows.exe"
 
-      - name: Upload Windows artifact
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
+            throw "ISCC.exe not found"
+          }
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $ver = "${{ steps.ver.outputs.version }}"
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          & $iscc `
+            "/DMyAppVersion=$ver" `
+            "/DMyAppSourceExe=dist\DIYDownloader.exe" `
+            "installer\diy_downloader.iss"
+          # Inno 默认输出到 release，文件名含版本
+          $setup = Get-ChildItem "release\*setup*.exe" | Select-Object -First 1
+          if (-not $setup) { throw "Installer not produced" }
+          $target = "release/DIYDownloader-$tag-windows-setup.exe"
+          if ($setup.FullName -ne (Resolve-Path $target -ErrorAction SilentlyContinue)) {
+            Copy-Item $setup.FullName $target -Force
+          }
+          Get-ChildItem release | Format-Table Name, Length
+
+      - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
           name: windows-release
-          path: release/DIYDownloader-${{ github.ref_name }}-windows.exe
+          path: |
+            release/DIYDownloader-${{ github.ref_name }}-windows.exe
+            release/DIYDownloader-${{ github.ref_name }}-windows-setup.exe
           if-no-files-found: error
 
   build-macos:
@@ -66,7 +115,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
       - name: Install dependencies
         run: |
@@ -83,6 +132,11 @@ jobs:
             --name "DIYDownloader" \
             --add-data "assets:assets" \
             --add-data "logo.png:." \
+            --hidden-import "yt_dlp" \
+            --collect-all "yt_dlp" \
+            --hidden-import "version" \
+            --hidden-import "updater" \
+            --hidden-import "video_batch_downloader" \
             "sheets_batch_downloader_modern.py"
 
           mkdir -p release
@@ -118,11 +172,12 @@ jobs:
       - name: Attest Build Provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: 'release/*'
+          subject-path: "release/*"
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: 'release/*'
-          name: 'DIY下载器 ${{ github.ref_name }}'
+          files: "release/*"
+          name: "DIY下载器 ${{ github.ref_name }}"
           body_path: release_notes.md
+          generate_release_notes: true
