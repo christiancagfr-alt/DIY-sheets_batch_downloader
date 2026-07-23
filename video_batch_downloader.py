@@ -55,29 +55,41 @@ YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 # 真实播放列表前缀；RD/UL 等为电台/混播，默认不当整表下载
 YOUTUBE_REAL_PLAYLIST_PREFIXES = ("PL", "UU", "FL", "OL", "LL", "WL", "TL")
 
-# 格式串说明：
-# - YouTube 高清几乎都是「视频轨 + 音频轨」分离，必须用 bestvideo+bestaudio 再合并
-# - 单文件 progressive（format 18 等）最高通常只有 360p，绝不能当 1080p 用
-# - 优先 avc1+m4a 便于合成兼容性好的 mp4；没有则回退 vp9/av1 + 最佳音轨
+# 画质策略（所有档位统一）：
+# 1) YouTube 高清几乎都是「纯视频轨 + 纯音频轨」，必须 bestvideo*+bestaudio，再由 ffmpeg 无损合并
+# 2) 绝不能优先 progressive 单文件（format 18 等），那通常只有 360p，看起来会非常糊
+# 3) 不优先 avc1：同分辨率下 vp9/av1 往往码率更高、更清晰；容器用 mkv 兼容合并
+# 4) format_sort 强制按分辨率 → 编码质量 → 码率排序
 def _height_format(max_h: int) -> str:
+    """在不超过 max_h 的前提下，选该档位内画质最好的分离流。"""
     return (
-        f"bestvideo[height<={max_h}][vcodec^=avc1]+bestaudio[ext=m4a]/"
-        f"bestvideo[height<={max_h}][vcodec^=avc1]+bestaudio/"
+        # 首选：该分辨率上限内最好的视频 + 最好音频（含 storyboard 以外的所有视频轨）
+        f"bestvideo*[height<={max_h}]+bestaudio/"
         f"bestvideo[height<={max_h}]+bestaudio/"
-        f"best[height<={max_h}]/"
-        f"bestvideo+bestaudio/best"
+        # 少数站点只有合成流时再退一步（仍限高度，避免误选超限）
+        f"best[height<={max_h}][vcodec!=none]/"
+        # 最后兜底：不限高度的分离流（源本身可能没有目标分辨率）
+        f"bestvideo*+bestaudio/best"
     )
 
 
 QUALITY_OPTIONS = {
-    "最佳质量": (
-        "bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/"
-        "bestvideo+bestaudio/best"
-    ),
+    # 原画画质：不限高度，选全站最好的视频轨+音轨
+    "最佳质量": "bestvideo*+bestaudio/bestvideo+bestaudio/best",
     "最高 1080p": _height_format(1080),
     "最高 720p": _height_format(720),
     "最高 480p": _height_format(480),
+    # 仅音频：尽量高码率
     "仅音频": "bestaudio/best",
+}
+
+# 期望分辨率（用于下载前校验是否误选到低清）
+QUALITY_TARGET_HEIGHT = {
+    "最佳质量": 0,       # 0 = 不强制下限，但会校验是否明显低于源最高分辨率
+    "最高 1080p": 1080,
+    "最高 720p": 720,
+    "最高 480p": 480,
+    "仅音频": 0,
 }
 
 # 下载模式
@@ -321,9 +333,21 @@ def default_ydl_opts(**extra) -> dict:
         "continuedl": True,
         "nopart": False,
         "updatetime": False,
-        # 优先高分辨率 / 高码率；不要用 android client（会只剩 360p 左右）
-        "format_sort": ["res", "fps", "hdr:12", "vbr", "abr", "tbr", "size"],
+        # 画质排序：分辨率 > HDR > 编码档次 > 帧率 > 视频码率 > 音频码率
+        # 不要强制 android client（会只剩约 360p）
+        "format_sort": [
+            "res",
+            "hdr:12",
+            "codec:av01:vp9.2:vp9:h265:h264",
+            "fps",
+            "vbr",
+            "abr",
+            "tbr",
+            "size",
+        ],
         "format_sort_force": True,
+        # 允许更大体积的高清流
+        "prefer_free_formats": False,
     }
     ffmpeg = resolve_ffmpeg_path()
     if ffmpeg:
@@ -399,10 +423,12 @@ def describe_selected_format(info: dict) -> str:
             a = f.get("acodec") or "none"
             fid = f.get("format_id")
             note = f.get("format_note") or ""
+            tbr = f.get("tbr") or f.get("vbr") or f.get("abr")
+            br = f"{float(tbr):.0f}kbps" if tbr else ""
             if v != "none":
-                parts.append(f"视频 {h or '?'}p/{fid}/{v}/{note}".strip("/"))
+                parts.append(f"视频 {h or '?'}p/{fid}/{v}/{note}/{br}".strip("/"))
             if a != "none":
-                parts.append(f"音频 {fid}/{a}")
+                parts.append(f"音频 {fid}/{a}/{br}".strip("/"))
     else:
         h = info.get("height")
         parts.append(
@@ -410,6 +436,72 @@ def describe_selected_format(info: dict) -> str:
             f"v={info.get('vcodec')} a={info.get('acodec')}"
         )
     return " + ".join(parts) if parts else "未知"
+
+
+def selected_video_height(info: dict) -> int:
+    if not info:
+        return 0
+    heights = []
+    for f in info.get("requested_formats") or [info]:
+        try:
+            h = int(f.get("height") or 0)
+        except (TypeError, ValueError):
+            h = 0
+        vcodec = (f.get("vcodec") or "none").lower()
+        if h > 0 and vcodec != "none":
+            heights.append(h)
+    return max(heights) if heights else 0
+
+
+def available_max_video_height(info: dict) -> int:
+    """源视频提供的最高视频高度（用于判断是否被错误选到低清）。"""
+    if not info:
+        return 0
+    heights = []
+    for f in info.get("formats") or []:
+        vcodec = (f.get("vcodec") or "none").lower()
+        if vcodec in ("none", ""):
+            continue
+        try:
+            h = int(f.get("height") or 0)
+        except (TypeError, ValueError):
+            h = 0
+        if h > 0:
+            heights.append(h)
+    return max(heights) if heights else 0
+
+
+def quality_selection_ok(quality_key: str, info: dict) -> tuple[bool, str]:
+    """
+    校验当前选择是否合理。
+    - 若源有更高清晰度，但我们选到了明显更低的流，判定失败（避免糊成 360p）。
+    """
+    if quality_key == "仅音频":
+        return True, ""
+    sel = selected_video_height(info)
+    avail = available_max_video_height(info)
+    target = int(QUALITY_TARGET_HEIGHT.get(quality_key, 0) or 0)
+
+    if not sel:
+        return False, "未能选中视频流（可能缺少 ffmpeg 或源无可用格式）"
+
+    # 源本身最高就很低：允许，但提示
+    if avail and avail <= 360 and sel <= avail:
+        return True, f"源视频最高约 {avail}p，已选 {sel}p"
+
+    # 期望档位：源具备目标分辨率，但实际选中远低于目标
+    if target and avail >= target and sel < int(target * 0.85):
+        return False, f"期望约 {target}p（源最高 {avail}p），实际只选到 {sel}p"
+
+    # 最佳质量 / 其它：源有高清却选到了很低
+    if avail >= 720 and sel <= 360:
+        return False, f"源最高 {avail}p，实际只选到 {sel}p（疑似低清回退）"
+
+    if target and sel > target + 16:
+        # 理论不应发生；高度过滤失效时提示
+        return True, f"实际 {sel}p 略高于目标 {target}p"
+
+    return True, f"已选 {sel}p（源最高 {avail or sel}p）"
 
 def entry_to_url(entry: dict, fallback: str = "") -> str:
     if not entry:
@@ -715,8 +807,8 @@ class VideoDownloadWorker(QThread):
             name = "%(title).180B [%(id)s].%(ext)s"
         return os.path.join(target_dir, name)
 
-    def _build_opts(self, target_dir: str, item: VideoItem, progress_hook: Callable) -> dict:
-        fmt = QUALITY_OPTIONS.get(self.quality_key, QUALITY_OPTIONS["最佳质量"])
+    def _build_opts(self, target_dir: str, item: VideoItem, progress_hook: Callable, format_override: str = "") -> dict:
+        fmt = format_override or QUALITY_OPTIONS.get(self.quality_key, QUALITY_OPTIONS["最佳质量"])
         ffmpeg = resolve_ffmpeg_path()
         opts = default_ydl_opts(
             outtmpl=self._outtmpl(target_dir, item),
@@ -734,24 +826,48 @@ class VideoDownloadWorker(QThread):
         )
         if ffmpeg:
             opts["ffmpeg_location"] = os.path.dirname(ffmpeg)
-            opts["merge_output_format"] = "mp4"
-            self.log.emit(f"使用 ffmpeg：{ffmpeg}")
+            # mkv 可无损封装 H.264/VP9/AV1+多种音频，避免为塞进 mp4 而选低清或转码变糊
+            opts["merge_output_format"] = "mkv"
+            self.log.emit(f"使用 ffmpeg：{ffmpeg}（合并容器 mkv，保留原画编码）")
         else:
             # 切勿降级为单文件 b（YouTube 常只有 360p）
             self.log.emit(
-                "警告：未检测到 ffmpeg。YouTube 1080p/高清需要合并视频+音频，"
-                "缺少 ffmpeg 时可能失败或画质很差。请安装 ffmpeg 并加入 PATH。"
+                "警告：未检测到 ffmpeg。所有高清档位（480p/720p/1080p/最佳）"
+                "都需要合并视频+音频；缺少 ffmpeg 时会失败或严重掉画质。"
+                "请安装 ffmpeg 并加入 PATH。"
             )
         if self.quality_key == "仅音频":
             if ffmpeg:
                 opts["postprocessors"] = [{
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "mp3",
-                    "preferredquality": "192",
+                    "preferredquality": "320",
                 }]
             else:
                 self.log.emit("未检测到 ffmpeg，仅音频将保留原始音频格式。")
         return opts
+
+    def _retry_format_candidates(self) -> list[str]:
+        """画质异常时的备选格式串：仍然只走分离高清流，绝不回退 360p progressive。"""
+        target = int(QUALITY_TARGET_HEIGHT.get(self.quality_key, 0) or 0)
+        cands = []
+        if target > 0:
+            cands.append(f"bestvideo*[height<={target}]+bestaudio")
+            cands.append(f"bestvideo[height<={target}]+bestaudio")
+            cands.append(f"bestvideo*[height<={target}][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo*[height<={target}]+bestaudio")
+        if self.quality_key == "最佳质量":
+            cands.extend([
+                "bestvideo*+bestaudio",
+                "bestvideo+bestaudio",
+                "bestvideo*[vcodec^=av01]+bestaudio/bestvideo*[vcodec^=vp09]+bestaudio/bestvideo*+bestaudio",
+            ])
+        # 去重并去掉与主格式完全相同的
+        primary = QUALITY_OPTIONS.get(self.quality_key, "")
+        out = []
+        for c in cands:
+            if c and c != primary and c not in out:
+                out.append(c)
+        return out
 
     def run(self):
         if yt_dlp is None:
@@ -852,42 +968,50 @@ class VideoDownloadWorker(QThread):
                     self.item_update.emit(item)
                     self.log.emit(f"发现未完成文件，继续下载：{path}")
 
-                opts = self._build_opts(target_dir, item, hook)
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    # 先解析并确认实际选中的分辨率（避免误下 360p）
-                    info = ydl.extract_info(item.url, download=False)
-                    if info:
-                        if info.get("_type") == "playlist":
-                            entries = [e for e in (info.get("entries") or []) if e]
-                            info = entries[0] if entries else info
-                        item.title = sanitize_filename(info.get("title") or item.title)
-                        item.duration = item.duration or format_duration(info.get("duration"))
-                        item.video_id = str(info.get("id") or item.video_id or "")
-                        if detect_platform(item.url) == "YouTube" and item.video_id and YOUTUBE_ID_RE.fullmatch(item.video_id):
-                            item.url = youtube_watch_url(item.video_id)
-                        fmt_desc = describe_selected_format(info)
-                        self.log.emit(f"画质选择 [{self.quality_key}]：{fmt_desc}")
-                        # 若期望 720/1080 却只拿到很低分辨率，给出明确警告
-                        sel_h = 0
-                        for f in (info.get("requested_formats") or [info]):
-                            try:
-                                sel_h = max(sel_h, int(f.get("height") or 0))
-                            except (TypeError, ValueError):
-                                pass
-                        want = 0
-                        if "1080" in self.quality_key:
-                            want = 1080
-                        elif "720" in self.quality_key:
-                            want = 720
-                        elif "480" in self.quality_key:
-                            want = 480
-                        if want and sel_h and sel_h < min(want, 720) and sel_h <= 360:
-                            self.log.emit(
-                                f"警告：期望约 {want}p，实际仅 {sel_h}p。"
-                                "请确认已安装 ffmpeg，并检查源视频是否提供该分辨率。"
-                            )
+                # 主格式 + 备选格式：全部档位都走高清分离流，失败才换下一串
+                format_try_list = [QUALITY_OPTIONS.get(self.quality_key, QUALITY_OPTIONS["最佳质量"])]
+                format_try_list.extend(self._retry_format_candidates())
+                last_err = None
+                downloaded = False
 
-                    ydl.download([item.url])
+                for fmt_idx, fmt in enumerate(format_try_list):
+                    if self.stop_event.is_set():
+                        break
+                    opts = self._build_opts(target_dir, item, hook, format_override=fmt)
+                    try:
+                        with yt_dlp.YoutubeDL(opts) as ydl:
+                            info = ydl.extract_info(item.url, download=False)
+                            if info:
+                                if info.get("_type") == "playlist":
+                                    entries = [e for e in (info.get("entries") or []) if e]
+                                    info = entries[0] if entries else info
+                                item.title = sanitize_filename(info.get("title") or item.title)
+                                item.duration = item.duration or format_duration(info.get("duration"))
+                                item.video_id = str(info.get("id") or item.video_id or "")
+                                if detect_platform(item.url) == "YouTube" and item.video_id and YOUTUBE_ID_RE.fullmatch(item.video_id):
+                                    item.url = youtube_watch_url(item.video_id)
+                                fmt_desc = describe_selected_format(info)
+                                self.log.emit(
+                                    f"画质尝试 {fmt_idx + 1}/{len(format_try_list)} [{self.quality_key}]：{fmt_desc}"
+                                )
+                                ok, reason = quality_selection_ok(self.quality_key, info)
+                                self.log.emit(f"画质校验：{reason}")
+                                if not ok:
+                                    # 源明明有高清却选到低清：换下一组格式串重试
+                                    last_err = RuntimeError(reason)
+                                    self.log.emit(f"画质不达标，换用备用格式…（{reason}）")
+                                    continue
+
+                            ydl.download([item.url])
+                            downloaded = True
+                            break
+                    except Exception as exc:
+                        last_err = exc
+                        self.log.emit(f"格式串失败，尝试备用：{exc}")
+                        continue
+
+                if not downloaded:
+                    raise last_err or RuntimeError("所有画质格式均失败")
 
                 saved = last_file["path"] or find_existing_or_partial(
                     target_dir, item.title, item.video_id
@@ -962,6 +1086,13 @@ class VideoBatchPage(QWidget):
         self.quality_combo = QComboBox()
         self.quality_combo.addItems(list(QUALITY_OPTIONS.keys()))
         self.quality_combo.setCurrentText("最佳质量")
+        self.quality_combo.setToolTip(
+            "全部档位均使用「最佳视频轨+最佳音轨」合并，不会故意下 360p 糊图。\n"
+            "· 最佳质量：源站最高分辨率/码率（可能 1440p/4K）\n"
+            "· 最高 1080p / 720p / 480p：不超过该高度内的最高画质\n"
+            "· 仅音频：最高码率音轨\n"
+            "需要本机 ffmpeg 才能合并高清（日志会提示是否检测到）。"
+        )
 
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(DOWNLOAD_MODES)
