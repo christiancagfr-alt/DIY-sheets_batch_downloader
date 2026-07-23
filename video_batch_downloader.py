@@ -47,6 +47,13 @@ try:
 except ImportError:  # pragma: no cover
     yt_dlp = None
 
+from env_tools import (
+    install_missing_components,
+    resolve_ffmpeg_path,
+    resolve_ffprobe_path,
+    scan_environment,
+)
+
 
 APP_SECTION = "YouTube / FB 视频"
 URL_RE = re.compile(r"https?://[^\s<>\"'，。；、]+", re.I)
@@ -371,44 +378,8 @@ def format_duration(seconds) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
-def resolve_ffmpeg_path() -> str:
-    """查找可用 ffmpeg，避免因找不到工具而静默降到 360p 单文件。"""
-    found = shutil.which("ffmpeg")
-    if found:
-        return found
-    # 常见便携/自定义安装路径
-    candidates = [
-        r"D:\software\audiokit\ffmpeg_win\ffmpeg.EXE",
-        r"C:\ffmpeg\bin\ffmpeg.exe",
-        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
-        r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe",
-        os.path.join(os.path.expanduser("~"), "ffmpeg", "bin", "ffmpeg.exe"),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "ffmpeg.exe"),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", "ffmpeg.exe"),
-    ]
-    if getattr(sys, "frozen", False):
-        base = os.path.dirname(os.path.abspath(sys.executable))
-        candidates.extend([
-            os.path.join(base, "ffmpeg.exe"),
-            os.path.join(base, "bin", "ffmpeg.exe"),
-            os.path.join(getattr(sys, "_MEIPASS", base), "ffmpeg.exe"),
-        ])
-    for path in candidates:
-        if path and os.path.isfile(path):
-            return path
-    try:
-        import imageio_ffmpeg  # type: ignore
-        path = imageio_ffmpeg.get_ffmpeg_exe()
-        if path and os.path.isfile(path):
-            return path
-    except Exception:
-        pass
-    return ""
-
-
 def has_ffmpeg() -> bool:
     return bool(resolve_ffmpeg_path())
-
 
 def describe_selected_format(info: dict) -> str:
     """用于日志：显示最终选中的分辨率/编码，方便排查画质问题。"""
@@ -1051,15 +1022,34 @@ class VideoDownloadWorker(QThread):
         self.done.emit()
 
 
+class EnvInstallWorker(QThread):
+    log = Signal(str)
+    progress = Signal(int, int)
+    finished_ok = Signal(object)
+    failed = Signal(str)
+
+    def run(self):
+        try:
+            report = install_missing_components(
+                progress=lambda d, t: self.progress.emit(d, t),
+                log=lambda m: self.log.emit(m),
+            )
+            self.finished_ok.emit(report)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class VideoBatchPage(QWidget):
     """独立的 YouTube / Facebook 批量下载板块。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.worker = None
+        self.env_worker = None
         self.preview_items: list[VideoItem] = []
         self.build_ui()
         self.connect_signals()
+        self.refresh_env_status(silent=True)
 
     def build_ui(self):
         root = QVBoxLayout(self)
@@ -1073,6 +1063,30 @@ class VideoBatchPage(QWidget):
         tip.setObjectName("subtitle")
         tip.setWordWrap(True)
         root.addWidget(tip)
+
+        # 环境检测条
+        env_bar = QFrame()
+        env_bar.setObjectName("compactPanel")
+        env_layout = QHBoxLayout(env_bar)
+        env_layout.setContentsMargins(14, 10, 14, 10)
+        env_layout.setSpacing(10)
+        root.addWidget(env_bar)
+
+        self.env_status_label = QLabel("正在检测运行环境…")
+        self.env_status_label.setObjectName("subtitle")
+        self.env_status_label.setWordWrap(True)
+        env_layout.addWidget(self.env_status_label, 1)
+
+        self.env_check_btn = QPushButton("检测环境")
+        self.env_check_btn.setObjectName("secondaryButton")
+        self.env_install_btn = QPushButton("一键安装组件")
+        self.env_install_btn.setObjectName("primaryButton")
+        self.env_install_btn.setToolTip(
+            "自动下载并安装高清合并所需的 ffmpeg / ffprobe 到本机用户目录。\n"
+            "源码运行时如缺 yt-dlp 也会尝试 pip 安装。"
+        )
+        env_layout.addWidget(self.env_check_btn)
+        env_layout.addWidget(self.env_install_btn)
 
         settings = QFrame()
         settings.setObjectName("compactPanel")
@@ -1272,6 +1286,120 @@ class VideoBatchPage(QWidget):
         self.start_btn.clicked.connect(self.start_download)
         self.stop_btn.clicked.connect(self.stop_task)
         self.open_folder_btn.clicked.connect(self.open_output_folder)
+        self.env_check_btn.clicked.connect(lambda: self.refresh_env_status(silent=False))
+        self.env_install_btn.clicked.connect(self.install_env_components)
+
+    def refresh_env_status(self, silent: bool = True):
+        report = scan_environment()
+        self.env_status_label.setText(report.summary_line())
+        missing = report.missing_required
+        self.env_install_btn.setEnabled(bool(missing) or not report.ready_for_hd)
+        if report.ready_for_hd:
+            self.env_status_label.setStyleSheet("color: #15803d; font-weight: 800;")
+            self.env_install_btn.setText("组件已就绪")
+        else:
+            self.env_status_label.setStyleSheet("color: #ca8a04; font-weight: 800;")
+            names = "、".join(c.name for c in missing) or "组件"
+            self.env_install_btn.setText(f"一键安装（缺 {names}）")
+        if not silent:
+            self.log(report.summary_line())
+            for c in report.components:
+                mark = "OK" if c.ok else "缺"
+                detail = c.detail or c.path or ""
+                self.log(f"[{mark}] {c.name}: {detail}")
+            if missing:
+                self.log("可点击「一键安装组件」自动下载安装 ffmpeg 等。")
+            else:
+                self.log("高清下载环境已就绪。")
+        return report
+
+    def install_env_components(self):
+        if self.env_worker and self.env_worker.isRunning():
+            QMessageBox.information(self, APP_SECTION, "正在安装组件，请稍候。")
+            return
+        if self.has_running_worker():
+            QMessageBox.information(self, APP_SECTION, "请先停止当前下载任务，再安装组件。")
+            return
+
+        report = scan_environment()
+        if report.ready_for_hd:
+            QMessageBox.information(
+                self,
+                APP_SECTION,
+                "必需组件已就绪。\n\n"
+                f"{report.summary_line()}\n\n"
+                "如需重装 ffmpeg：删除 %LOCALAPPDATA%\\DIYDownloader\\tools 后再次点击安装。",
+            )
+            self.refresh_env_status(silent=False)
+            return
+
+        reply = QMessageBox.question(
+            self,
+            APP_SECTION,
+            "将自动下载并安装高清视频合并所需组件：\n\n"
+            "· ffmpeg / ffprobe（必需，约数十 MB）\n"
+            "· yt-dlp（仅源码运行且缺失时）\n\n"
+            "安装位置：%LOCALAPPDATA%\\DIYDownloader\\tools\\bin\n\n"
+            "是否开始一键安装？",
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.env_check_btn.setEnabled(False)
+        self.env_install_btn.setEnabled(False)
+        self.env_status_label.setText("正在安装组件，请稍候…")
+        self.log("开始一键安装运行环境组件…")
+
+        worker = EnvInstallWorker()
+        worker.log.connect(self.log)
+        worker.progress.connect(self.on_env_install_progress)
+        worker.finished_ok.connect(self.on_env_install_done)
+        worker.failed.connect(self.on_env_install_failed)
+        worker.finished.connect(self.on_env_worker_finished)
+        self.env_worker = worker
+        worker.start()
+
+    def on_env_install_progress(self, done: int, total: int):
+        if total:
+            pct = int(done * 100 / max(total, 1))
+            self.env_status_label.setText(f"正在下载组件… {pct}%")
+            self.status_row.setText(f"组件下载 {pct}%")
+
+    def on_env_install_done(self, report):
+        self.refresh_env_status(silent=False)
+        if report.ready_for_hd:
+            QMessageBox.information(
+                self,
+                APP_SECTION,
+                "组件安装完成，高清下载环境已就绪。\n\n"
+                f"{report.summary_line()}\n\n"
+                "请重新选择画质并开始下载。",
+            )
+            self.log("组件安装完成，可以开始高清下载。")
+        else:
+            missing = "、".join(c.name for c in report.missing_required) or "未知"
+            QMessageBox.warning(
+                self,
+                APP_SECTION,
+                f"安装流程结束，但仍缺少：{missing}\n\n请查看日志或手动安装 ffmpeg。",
+            )
+
+    def on_env_install_failed(self, message: str):
+        self.log(f"组件安装失败：{message}")
+        self.env_status_label.setText(f"安装失败：{message}")
+        self.refresh_env_status(silent=True)
+        QMessageBox.warning(
+            self,
+            APP_SECTION,
+            f"一键安装失败：\n{message}\n\n"
+            "可手动安装 ffmpeg 并加入 PATH，或检查网络后重试。",
+        )
+
+    def on_env_worker_finished(self):
+        self.env_check_btn.setEnabled(True)
+        self.env_install_btn.setEnabled(True)
+        if self.sender() is self.env_worker:
+            self.env_worker = None
 
     def log(self, message: str):
         now = time.strftime("%H:%M:%S")
@@ -1425,6 +1553,22 @@ class VideoBatchPage(QWidget):
         if not urls:
             QMessageBox.information(self, APP_SECTION, "请先粘贴视频或播放列表链接。")
             return
+
+        # 下载前强制检查高清环境
+        env = self.refresh_env_status(silent=True)
+        if not env.ready_for_hd:
+            missing = "、".join(c.name for c in env.missing_required) or "ffmpeg"
+            ask = QMessageBox.question(
+                self,
+                APP_SECTION,
+                f"检测到缺少必需组件：{missing}\n\n"
+                "没有 ffmpeg 时高清视频会合并失败或严重掉画质。\n\n"
+                "是否现在一键安装组件？\n"
+                "（选「No」将仍尝试下载，但不推荐）",
+            )
+            if ask == QMessageBox.StandardButton.Yes:
+                self.install_env_components()
+                return
 
         mode = self.current_mode()
         limit = self.playlist_limit_spin.value()
