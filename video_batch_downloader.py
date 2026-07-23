@@ -131,13 +131,25 @@ def sanitize_filename(value: str) -> str:
     return (text[:180] or "video")
 
 
+def host_matches(host: str, *domains: str) -> bool:
+    """安全判断主机名是否等于或属于某域名（避免子串误匹配，满足 CodeQL）。"""
+    h = (host or "").lower().strip().split(":")[0].rstrip(".")
+    if h.startswith("www."):
+        h = h[4:]
+    for domain in domains:
+        d = (domain or "").lower().strip().rstrip(".")
+        if not d:
+            continue
+        if h == d or h.endswith("." + d):
+            return True
+    return False
+
+
 def detect_platform(url: str) -> str:
     host = (urlparse(url).netloc or "").lower()
-    if host.startswith("www."):
-        host = host[4:]
-    if "youtube.com" in host or "youtu.be" in host or "youtube-nocookie.com" in host:
+    if host_matches(host, "youtube.com", "youtu.be", "youtube-nocookie.com"):
         return "YouTube"
-    if "facebook.com" in host or "fb.watch" in host or host.endswith("fb.com") or "fbcdn.net" in host:
+    if host_matches(host, "facebook.com", "fb.com", "fb.watch", "fbcdn.net"):
         return "Facebook"
     return "其他"
 
@@ -156,7 +168,7 @@ def extract_youtube_video_id(url: str) -> str:
         if values and YOUTUBE_ID_RE.fullmatch(values[0]):
             return values[0]
 
-    if "youtu.be" in host:
+    if host_matches(host, "youtu.be"):
         part = path.strip("/").split("/")[0]
         if YOUTUBE_ID_RE.fullmatch(part):
             return part
@@ -214,7 +226,7 @@ def normalize_facebook_url(url: str) -> str:
     path = parsed.path or ""
     qs = parse_qs(parsed.query)
 
-    if "fb.watch" in host:
+    if host_matches(host, "fb.watch"):
         return raw.split("?")[0].rstrip("/")
 
     # /reel/ID or /reels/ID

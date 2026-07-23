@@ -142,7 +142,12 @@ class Downloader:
             content_type = response.headers.get("Content-Type", "")
             content_disposition = response.headers.get("Content-Disposition", "")
 
-        if "text/html" in content_type.lower() and "drive.google.com" in download_url:
+        download_host = (urlparse(download_url).netloc or "").lower().split(":")[0].rstrip(".")
+        if download_host.startswith("www."):
+            download_host = download_host[4:]
+        is_drive_host = download_host == "drive.google.com" or download_host.endswith(".drive.google.com")
+
+        if "text/html" in content_type.lower() and is_drive_host:
             confirm_url = self._find_drive_confirm_url(data, download_url)
             if confirm_url:
                 with self.opener.open(self._request(confirm_url), timeout=60) as response:
@@ -150,7 +155,7 @@ class Downloader:
                     content_type = response.headers.get("Content-Type", "")
                     content_disposition = response.headers.get("Content-Disposition", "")
 
-        if "text/html" in content_type.lower() and "drive.google.com" in download_url:
+        if "text/html" in content_type.lower() and is_drive_host:
             raise RuntimeError("Drive 返回的是网页，不是文件。请确认链接公开可下载，或改用 Chrome 扩展使用当前浏览器登录状态。")
 
         remote_name = filename_from_content_disposition(content_disposition)
